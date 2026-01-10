@@ -21,10 +21,13 @@ namespace RawDxPlayerWpf
         private DxRenderer _renderer;
         private D3DImageHost _d3dImageHost;
 
-        // 将来ここを CUDA DLL 呼び出し実装に差し替える（今はnull=何もしない）
-        private IImageProcessor _processor = null;
+        // CUDA DLL 呼び出し実装
+        private IImageProcessor _processor = new NativeImageProcessor();
         private WriteableBitmap _wb;
-
+        
+        // Phase 2-1: DLLはまだ output を書かないので、WPF側で input->output copy する
+        private bool _processorWritesOutput = false;
+        
         public MainWindow()
         {
             InitializeComponent();
@@ -40,6 +43,8 @@ namespace RawDxPlayerWpf
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            _processor?.Shutdown();
+
             StopPlayback();
             _renderer?.Dispose();
             _d3dImageHost?.Dispose();
@@ -84,7 +89,18 @@ namespace RawDxPlayerWpf
             // Rendererを作り直す（サイズ変わる可能性があるため）
             _renderer?.Dispose();
             _renderer = new DxRenderer(_seq.Width, _seq.Height);
+            
+            // ②のための初期化枠（今は _processor=null なので呼ばれない）
+            if (_processor != null)
+            {
+                int gpuId = 0;
+                _processor.Initialize(gpuId, _renderer.InputSharedHandle, _renderer.OutputSharedHandle);
 
+                // パラメータセット（window/levelと、edgeは一旦OFF）
+                var p = NativeImageProc.MakeDefaultParams(window: 30000, level: 30000, enableEdge: 0);
+                _processor.SetParameters(p);
+            }
+            
             // WPF表示用の WriteableBitmap を作成
             _wb = new WriteableBitmap(
                 _seq.Width, _seq.Height,
@@ -139,20 +155,34 @@ namespace RawDxPlayerWpf
             int window = ParseOrDefault(TbWindow.Text, 4000);
             int level = ParseOrDefault(TbLevel.Text, 2000);
 
-            // 読み込み（16-bit）→ BGRA(8-bit) へ変換
-            var bgra = RawFrameReader.Load16ToBgra8(path, _seq.Width, _seq.Height, window, level);
+            // 16bit→BGRA（CPU）
+            var bgraIn = RawFrameReader.Load16ToBgra8(path, _seq.Width, _seq.Height, window, level);
 
-            // 将来：ここで _processor.Process(in/out texture) に切り替える
-            // 今はCPU変換結果をD3D11テクスチャへ更新
-            _renderer.UpdateFrame(bgra);
+            // ① 入力テクスチャ更新（DX側）
+            _renderer.UploadInputBgra(bgraIn);
 
+            // ② 画像処理（今は未実装なので passthrough）
+            if (_processor != null)
+            {
+                // 将来：_processor.Execute() が outputTexture に書く
+                _processor.Execute();
+            }
+            else
+            {
+                // 今は input -> output へコピー
+                _renderer.PassthroughCopyInputToOutput();
+            }
 
-            // 画面表示（WriteableBitmap）
-            _wb.WritePixels(
-                new Int32Rect(0, 0, _seq.Width, _seq.Height),
-                bgra,
-                _seq.Width * 4,   // stride
-                0);
+            // Phase 2-1 の間は WPF 側で input -> output へコピーして表示を保証する
+            // Phase 2-2 以降で DLL が output を確実に書くようになったら _processorWritesOutput=true にしてOFFにする
+            if (!_processorWritesOutput)
+            {
+                _renderer.PassthroughCopyInputToOutput();
+            }
+
+            // ③ 出力を readback して表示（安定：WriteableBitmap）
+            var bgraOut = _renderer.ReadbackOutputBgra();
+            _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgraOut, _seq.Width * 4, 0);
 
 
             TbStatus.Text = $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}";

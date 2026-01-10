@@ -85,6 +85,8 @@
       <SubType>Designer</SubType>
     </ApplicationDefinition>
     <Compile Include="Processing\IImageProcessor.cs" />
+    <Compile Include="Processing\NativeImageProc.cs" />
+    <Compile Include="Processing\NativeImageProcessor.cs" />
     <Compile Include="Raw\RawFrameReader.cs" />
     <Compile Include="Raw\RawSequence.cs" />
     <Page Include="MainWindow.xaml">

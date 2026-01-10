@@ -12,29 +12,36 @@ namespace RawDxPlayerWpf.Dx
         private readonly Device _device;
         private readonly DeviceContext _ctx;
 
-        // 共有テクスチャ（WPF表示・将来CUDA処理の入出力として使う）
-        private readonly Texture2D _sharedTexture;
-        private readonly IntPtr _sharedHandle;
+        // 入力（CPU→GPU）
+        private readonly Texture2D _inputSharedTex;
+        private readonly IntPtr _inputSharedHandle;
 
-        // CPU書き込み用（毎フレームMapするのはこっち）
-        private readonly Texture2D _stagingTexture;
+        // 出力（GPU処理結果：②がここへ書く）
+        private readonly Texture2D _outputSharedTex;
+        private readonly IntPtr _outputSharedHandle;
+
+        // CPU書き込み用（inputに転送する）
+        private readonly Texture2D _stagingUpload;
+
+        // CPU読み戻し用（outputから読む）
+        private readonly Texture2D _stagingReadback;
 
         private readonly int _width;
         private readonly int _height;
 
-        public IntPtr SharedTextureHandle => _sharedHandle;
+        public IntPtr InputSharedHandle => _inputSharedHandle;
+        public IntPtr OutputSharedHandle => _outputSharedHandle;
 
         public DxRenderer(int width, int height)
         {
             _width = width;
             _height = height;
 
-            var flags = DeviceCreationFlags.BgraSupport;
-            _device = new Device(DriverType.Hardware, flags);
+            _device = new Device(DriverType.Hardware, DeviceCreationFlags.BgraSupport);
             _ctx = _device.ImmediateContext;
 
-            // 1) 共有テクスチャ（GPU側、CPUは直接Mapしない）
-            var sharedDesc = new Texture2DDescription
+            // 共有テクスチャ（Default + Shared）
+            Texture2DDescription SharedDesc() => new Texture2DDescription
             {
                 Width = width,
                 Height = height,
@@ -46,19 +53,19 @@ namespace RawDxPlayerWpf.Dx
                 Usage = ResourceUsage.Default,
                 BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
                 CpuAccessFlags = CpuAccessFlags.None,
-
-                // 将来、CUDA/DX interop で共有するため
                 OptionFlags = ResourceOptionFlags.Shared
             };
 
-            _sharedTexture = new Texture2D(_device, sharedDesc);
-            using (var resource = _sharedTexture.QueryInterface<SharpDX.DXGI.Resource>())
-            {
-                _sharedHandle = resource.SharedHandle;
-            }
+            _inputSharedTex = new Texture2D(_device, SharedDesc());
+            using (var r = _inputSharedTex.QueryInterface<SharpDX.DXGI.Resource>())
+                _inputSharedHandle = r.SharedHandle;
 
-            // 2) CPU書き込み用ステージングテクスチャ
-            var stagingDesc = new Texture2DDescription
+            _outputSharedTex = new Texture2D(_device, SharedDesc());
+            using (var r = _outputSharedTex.QueryInterface<SharpDX.DXGI.Resource>())
+                _outputSharedHandle = r.SharedHandle;
+
+            // CPU→GPU upload（Mapするのはこっち）
+            _stagingUpload = new Texture2D(_device, new Texture2DDescription
             {
                 Width = width,
                 Height = height,
@@ -71,24 +78,33 @@ namespace RawDxPlayerWpf.Dx
                 BindFlags = BindFlags.None,
                 CpuAccessFlags = CpuAccessFlags.Write,
                 OptionFlags = ResourceOptionFlags.None
-            };
+            });
 
-            _stagingTexture = new Texture2D(_device, stagingDesc);
+            // GPU→CPU readback（outputを読む）
+            _stagingReadback = new Texture2D(_device, new Texture2DDescription
+            {
+                Width = width,
+                Height = height,
+                ArraySize = 1,
+                MipLevels = 1,
+                Format = Format.B8G8R8A8_UNorm,
+                SampleDescription = new SampleDescription(1, 0),
+
+                Usage = ResourceUsage.Staging,
+                BindFlags = BindFlags.None,
+                CpuAccessFlags = CpuAccessFlags.Read,
+                OptionFlags = ResourceOptionFlags.None
+            });
         }
 
-        // bgra: width*height*4 bytes
-        public void UpdateFrame(byte[] bgra)
+        // inputSharedTex を更新
+        public void UploadInputBgra(byte[] bgra)
         {
             if (bgra == null) throw new ArgumentNullException(nameof(bgra));
             if (bgra.Length != _width * _height * 4)
                 throw new ArgumentException("Invalid frame size", nameof(bgra));
 
-            // staging を Map して CPU で書く
-            var box = _ctx.MapSubresource(
-                _stagingTexture, 0,
-                MapMode.Write,
-                SharpDX.Direct3D11.MapFlags.None);
-
+            var box = _ctx.MapSubresource(_stagingUpload, 0, MapMode.Write, SharpDX.Direct3D11.MapFlags.None);
             try
             {
                 using (var stream = new DataStream(box.DataPointer, box.RowPitch * _height, true, true))
@@ -107,17 +123,56 @@ namespace RawDxPlayerWpf.Dx
             }
             finally
             {
-                _ctx.UnmapSubresource(_stagingTexture, 0);
+                _ctx.UnmapSubresource(_stagingUpload, 0);
             }
 
-            // staging → shared にGPUコピー
-            _ctx.CopyResource(_stagingTexture, _sharedTexture);
+            _ctx.CopyResource(_stagingUpload, _inputSharedTex);
+        }
+
+        // いまは「処理なし」なので input→output へコピー（②実装後は不要）
+        public void PassthroughCopyInputToOutput()
+        {
+            _ctx.CopyResource(_inputSharedTex, _outputSharedTex);
+        }
+
+        // outputSharedTex をCPUへ読み戻し（表示用）
+        public byte[] ReadbackOutputBgra()
+        {
+            _ctx.CopyResource(_outputSharedTex, _stagingReadback);
+
+            var box = _ctx.MapSubresource(_stagingReadback, 0, MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
+            try
+            {
+                byte[] bgra = new byte[_width * _height * 4];
+                using (var stream = new DataStream(box.DataPointer, box.RowPitch * _height, true, true))
+                {
+                    int dstStride = _width * 4;
+                    int srcStride = box.RowPitch;
+
+                    int dstOffset = 0;
+                    for (int y = 0; y < _height; y++)
+                    {
+                        stream.Position = y * srcStride;
+                        stream.Read(bgra, dstOffset, dstStride);
+                        dstOffset += dstStride;
+                    }
+                }
+                return bgra;
+            }
+            finally
+            {
+                _ctx.UnmapSubresource(_stagingReadback, 0);
+            }
         }
 
         public void Dispose()
         {
-            _stagingTexture?.Dispose();
-            _sharedTexture?.Dispose();
+            _stagingReadback?.Dispose();
+            _stagingUpload?.Dispose();
+
+            _outputSharedTex?.Dispose();
+            _inputSharedTex?.Dispose();
+
             _ctx?.Dispose();
             _device?.Dispose();
         }
