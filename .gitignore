@@ -1,0 +1,136 @@
+###############################################################################
+# Visual Studio / MSBuild
+###############################################################################
+.vs/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Build configurations (in case they appear at repo root)
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Aa]rm/
+[Aa]rm64/
+
+# Visual Studio cache / local state
+.vscode/
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+# Test results / coverage
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+
+# MSBuild binary log
+*.binlog
+
+###############################################################################
+# NuGet (packages.config / legacy packages folder)
+###############################################################################
+# packages.config is tracked; packages/ can be restored by NuGet
+packages/
+# NuGet v3+ cache is global, but keep these ignored just in case
+.nuget/
+**/packages.lock.json
+
+###############################################################################
+# WPF / .NET build artifacts
+###############################################################################
+*.pdb
+*.ipdb
+*.iobj
+*.dll
+*.exe
+*.appx
+*.msi
+*.nupkg
+*.snupkg
+*.cache
+*.ilk
+
+###############################################################################
+# C++ / Native intermediate and outputs
+###############################################################################
+# Intermediate directories often created by VS for C++ projects
+ipch/
+[Bb]uild/
+*/[Ii]nterm*/          # "Intermediate", "IntermediateOutput", etc.
+*/[Oo]utput*/
+*/[Bb]uild*/
+*.obj
+*.pch
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.VC.db
+*.VC.VC.opendb
+
+# CMake (if you ever add it)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+out/
+
+###############################################################################
+# CUDA (NVCC) artifacts
+###############################################################################
+*.cubin
+*.ptx
+*.fatbin
+*.gpu
+*.nvprof
+*.cudafe1.cpp
+*.cudafe1.stub.c
+*.cu.cpp
+*.cu.obj
+*.cu.o
+
+###############################################################################
+# DirectX / Shader compile outputs (common in Dx folder)
+###############################################################################
+*.cso
+*.fxo
+*.pso
+*.d3dasm
+
+###############################################################################
+# Local assets / raw data / large binaries (project-specific)
+###############################################################################
+# If Raw/ contains big sample data or generated frames, ignore by default.
+# (If Raw/ holds source assets you want to version, delete the next line.)
+Raw/
+
+# Common generated media/data
+*.raw
+*.bin
+*.dat
+*.mp4
+*.avi
+*.mov
+*.tif
+*.tiff
+
+###############################################################################
+# OS junk
+###############################################################################
+Thumbs.db
+Desktop.ini
+.DS_Store
