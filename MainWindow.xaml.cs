@@ -88,12 +88,12 @@ namespace RawDxPlayerWpf
 
             // Rendererを作り直す（サイズ変わる可能性があるため）
             _renderer?.Dispose();
-            _renderer = new DxRenderer(_seq.Width, _seq.Height);
+            int gpuId = 0;
+            _renderer = new DxRenderer(_seq.Width, _seq.Height, gpuId);
             
             // ②のための初期化枠（今は _processor=null なので呼ばれない）
             if (_processor != null)
             {
-                int gpuId = 0;
                 _processor.Initialize(gpuId, _renderer.InputSharedHandle, _renderer.OutputSharedHandle);
 
                 // パラメータセット（window/levelと、edgeは一旦OFF）
@@ -161,26 +161,21 @@ namespace RawDxPlayerWpf
             // ① 入力テクスチャ更新（DX側）
             _renderer.UploadInputBgra(bgraIn);
 
-            // ② 画像処理（今は未実装なので passthrough）
-            if (_processor != null)
+            // DLL処理ON/OFF
+            bool dllOn = (CbDllOn.IsChecked == true);
+
+            if (dllOn && _processor != null)
             {
-                // 将来：_processor.Execute() が outputTexture に書く
+                // DLLが outputTexture を更新する（Phase 2-2ではin->out copy）
                 _processor.Execute();
             }
             else
             {
-                // 今は input -> output へコピー
+                // DLL処理OFF：WPF側で input -> output へコピー（表示を保証）
                 _renderer.PassthroughCopyInputToOutput();
             }
 
-            // Phase 2-1 の間は WPF 側で input -> output へコピーして表示を保証する
-            // Phase 2-2 以降で DLL が output を確実に書くようになったら _processorWritesOutput=true にしてOFFにする
-            if (!_processorWritesOutput)
-            {
-                _renderer.PassthroughCopyInputToOutput();
-            }
-
-            // ③ 出力を readback して表示（安定：WriteableBitmap）
+            // ③ 出力を readback して表示
             var bgraOut = _renderer.ReadbackOutputBgra();
             _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgraOut, _seq.Width * 4, 0);
 

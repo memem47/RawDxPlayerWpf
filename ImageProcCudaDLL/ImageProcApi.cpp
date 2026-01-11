@@ -3,6 +3,18 @@
 #include <atomic>
 #include <mutex>
 
+#include <d3d11.h>
+#include <dxgi.h>
+#include <wrl/client.h>
+
+using Microsoft::WRL::ComPtr;
+
+static ComPtr<ID3D11Device>        g_device;
+static ComPtr<ID3D11DeviceContext> g_context;
+static ComPtr<ID3D11Texture2D>     g_inputTex;
+static ComPtr<ID3D11Texture2D>     g_outputTex;
+
+
 static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
 static std::mutex g_mtx;
@@ -15,54 +27,102 @@ static int32_t ValidateParams(const IPC_Params* p)
     return IPC_OK;
 }
 
+static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11DeviceContext** ctx)
+{
+    ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)factory.GetAddressOf());
+    if (FAILED(hr)) return hr;
+
+    ComPtr<IDXGIAdapter1> adapter;
+    hr = factory->EnumAdapters1((UINT)gpuId, adapter.GetAddressOf());
+    if (FAILED(hr)) return hr;
+
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+    D3D_FEATURE_LEVEL fl;
+    return D3D11CreateDevice(
+        adapter.Get(),
+        D3D_DRIVER_TYPE_UNKNOWN, // ← adapter指定時は UNKNOWN
+        nullptr,
+        flags,
+        nullptr, 0,
+        D3D11_SDK_VERSION,
+        dev,
+        &fl,
+        ctx
+    );
+}
 extern "C" {
-
-    int32_t IPC_Init(int32_t gpuId, void* inSharedHandle, void* outSharedHandle)
+    int __cdecl IPC_Init(int gpuId, HANDLE inSharedHandle, HANDLE outSharedHandle)
     {
-        // Phase 2-1 では引数を受け取るだけ（D3D11/OpenSharedResourceはまだやらない）
         (void)gpuId;
-        (void)inSharedHandle;
-        (void)outSharedHandle;
 
-        std::lock_guard<std::mutex> lock(g_mtx);
+        if (!inSharedHandle || !outSharedHandle)
+            return -100;
 
-        // デフォルトparams
-        g_params.sizeBytes = sizeof(IPC_Params);
-        g_params.version = 1;
-        g_params.window = 4000;
-        g_params.level = 2000;
-        g_params.enableEdge = 0;
+        g_inputTex.Reset();
+        g_outputTex.Reset();
+        g_context.Reset();
+        g_device.Reset();
 
-        g_initialized = true;
-        return IPC_OK;
+        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+        D3D_FEATURE_LEVEL fl;
+
+        HRESULT hr = CreateDeviceOnAdapterIndex(gpuId, &g_device, &g_context);
+        if (FAILED(hr)) return -1;
+
+        hr = g_device->OpenSharedResource(inSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_inputTex.GetAddressOf());
+        if (FAILED(hr)) return -2;
+
+        hr = g_device->OpenSharedResource(outSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_outputTex.GetAddressOf());
+        if (FAILED(hr)) return -3;
+
+        // 念のためフォーマット・サイズ確認
+        D3D11_TEXTURE2D_DESC inDesc{}, outDesc{};
+        g_inputTex->GetDesc(&inDesc);
+        g_outputTex->GetDesc(&outDesc);
+
+        if (inDesc.Width != outDesc.Width ||
+            inDesc.Height != outDesc.Height ||
+            inDesc.Format != outDesc.Format)
+            return -4;
+
+        return 0;
     }
 
-    int32_t IPC_SetParams(const IPC_Params* p)
+    int __cdecl IPC_SetParams(const IPC_Params* p)
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        if (!g_initialized) return IPC_ERR_NOT_INITIALIZED;
-
-        int32_t v = ValidateParams(p);
-        if (v != IPC_OK) return v;
+        if (!p || p->sizeBytes < sizeof(IPC_Params))
+            return -200;
 
         g_params = *p;
-        return IPC_OK;
+        return 0;
     }
 
-    int32_t IPC_Execute()
+    int __cdecl IPC_Execute()
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        if (!g_initialized) return IPC_ERR_NOT_INITIALIZED;
+        if (!g_context || !g_inputTex || !g_outputTex)
+            return -10;
 
-        // Phase 2-1：何もしない（成功だけ返す）
-        return IPC_OK;
+        // GPU 上で input → output コピー
+        g_context->CopyResource(
+            g_outputTex.Get(),
+            g_inputTex.Get()
+        );
+
+        g_context->Flush(); // ★追加
+
+        return 0;
     }
 
-    int32_t IPC_Shutdown()
+    int __cdecl IPC_Shutdown()
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        g_initialized = false;
-        return IPC_OK;
+        g_inputTex.Reset();
+        g_outputTex.Reset();
+        g_context.Reset();
+        g_device.Reset();
+        return 0;
     }
 
 } // extern "C"

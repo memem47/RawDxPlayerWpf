@@ -1,8 +1,9 @@
-﻿using System;
-using SharpDX;
+﻿using SharpDX;
 using SharpDX.Direct3D;
 using SharpDX.Direct3D11;
 using SharpDX.DXGI;
+using System;
+using System.Windows.Controls;
 using Device = SharpDX.Direct3D11.Device;
 
 namespace RawDxPlayerWpf.Dx
@@ -32,13 +33,19 @@ namespace RawDxPlayerWpf.Dx
         public IntPtr InputSharedHandle => _inputSharedHandle;
         public IntPtr OutputSharedHandle => _outputSharedHandle;
 
-        public DxRenderer(int width, int height)
+        public DxRenderer(int width, int height, int gpuId)
         {
             _width = width;
             _height = height;
 
-            _device = new Device(DriverType.Hardware, DeviceCreationFlags.BgraSupport);
+            var factory = new Factory1();
+            var adapter = factory.GetAdapter1(gpuId);   // gpuId を使う
+            _device = new Device(adapter, DeviceCreationFlags.BgraSupport);
             _ctx = _device.ImmediateContext;
+
+            // factory/adapter は Dispose してOK（Deviceが保持）
+            adapter.Dispose();
+            factory.Dispose();
 
             // 共有テクスチャ（Default + Shared）
             Texture2DDescription SharedDesc() => new Texture2DDescription
@@ -138,6 +145,7 @@ namespace RawDxPlayerWpf.Dx
         // outputSharedTex をCPUへ読み戻し（表示用）
         public byte[] ReadbackOutputBgra()
         {
+            _ctx.Flush();  // ★追加（コピー前でも後でもOK、まずは前）
             _ctx.CopyResource(_outputSharedTex, _stagingReadback);
 
             var box = _ctx.MapSubresource(_stagingReadback, 0, MapMode.Read, SharpDX.Direct3D11.MapFlags.None);

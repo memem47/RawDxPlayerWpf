@@ -23,6 +23,12 @@
 
             <TextBlock VerticalAlignment="Center" Margin="12,0,6,0" Text="Level:"/>
             <TextBox x:Name="TbLevel" Width="80" Text="30000"/>
+
+            <CheckBox x:Name="CbDllOn"
+                      Content="DLL processing"
+                      IsChecked="True"
+                      VerticalAlignment="Center"
+                      Margin="12,0,0,0"/>
         </DockPanel>
 
         <Border Grid.Row="1" Margin="8" BorderBrush="Gray" BorderThickness="1">
