@@ -147,30 +147,33 @@ namespace RawDxPlayerWpf
 
             string path = _seq.Files[_index];
 
-            // 現状は CPU で WL/WW して BGRA を作って input に upload
-            byte[] bgra = RawFrameReader.Load16ToBgra8(path, _seq.Width, _seq.Height, _window, _level);
-            _renderer.UploadInputBgra(bgra);
+            // ① RAW16をそのまま読み込んで input(R16) に upload
+            byte[] raw16 = RawFrameReader.Load16RawBytes(path, _seq.Width, _seq.Height);
+            _renderer.UploadInputRaw16(raw16);
 
             bool dllOn = (CbDllOn.IsChecked == true);
 
             if (dllOn && _dllInitialized)
             {
-                // GUI変更を DLL へ反映（軽ければ毎フレームでもOK）
+                // ★注意：この段階では DLL 側がまだ BGRA input 前提の可能性が高いです。
+                // B(=DLL側R16対応)が終わるまで DLL ON は使わないのが安全です。
                 ApplyParamsToDll();
                 _processor.Execute();
             }
             else
             {
-                // DLL OFF: input を output にコピーして表示
-                _renderer.PassthroughCopyInputToOutput();
+                // ② DLL OFF の場合はCPUでWL/WWして output(BGRA) に書く
+                byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16, _seq.Width, _seq.Height, _window, _level);
+                _renderer.UploadOutputBgra(bgra);
             }
 
-            // output readback -> WriteableBitmap
-            byte[] bgraOut = _renderer.ReadbackOutputBgra();
+            // ③ 出力を readback して表示
+            var bgraOut = _renderer.ReadbackOutputBgra();
             _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgraOut, _seq.Width * 4, 0);
 
             TbStatus.Text = $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}";
         }
+
 
         // ---- GUI events: Params ----
 

@@ -1,25 +1,25 @@
-#define IMAGEPROCCUDADLL_EXPORTS
+Ôªø#define IMAGEPROCCUDADLL_EXPORTS
 #include "ImageProcApi.h"
-#include <atomic>
-#include <mutex>
 
 #include <d3d11.h>
 #include <dxgi.h>
 #include <wrl/client.h>
 
+#include <atomic>
+#include <mutex>
+
 #include <cuda_runtime.h>
 #include <cuda_d3d11_interop.h>
 
+using Microsoft::WRL::ComPtr;
+
 static cudaGraphicsResource* g_cudaIn = nullptr;
 static cudaGraphicsResource* g_cudaOut = nullptr;
-
-using Microsoft::WRL::ComPtr;
 
 static ComPtr<ID3D11Device>        g_device;
 static ComPtr<ID3D11DeviceContext> g_context;
 static ComPtr<ID3D11Texture2D>     g_inputTex;
 static ComPtr<ID3D11Texture2D>     g_outputTex;
-
 
 static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
@@ -50,7 +50,7 @@ static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11D
     D3D_FEATURE_LEVEL fl;
     return D3D11CreateDevice(
         adapter.Get(),
-        D3D_DRIVER_TYPE_UNKNOWN, // Å© adapteréwíËéûÇÕ UNKNOWN
+        D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
         flags,
         nullptr, 0,
@@ -60,118 +60,112 @@ static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11D
         ctx
     );
 }
+
 extern "C" {
-    int __cdecl IPC_Init(int gpuId, HANDLE inSharedHandle, HANDLE outSharedHandle)
+
+    int32_t __cdecl IPC_Init(int32_t gpuId, void* inSharedHandle, void* outSharedHandle)
     {
-        (void)gpuId;
+        if (!inSharedHandle || !outSharedHandle) return IPC_ERR_INVALIDARG;
 
-        if (!inSharedHandle || !outSharedHandle)
-            return -100;
+        // reset
+        IPC_Shutdown();
 
-        g_inputTex.Reset();
-        g_outputTex.Reset();
-        g_context.Reset();
-        g_device.Reset();
-
-        UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-
-        D3D_FEATURE_LEVEL fl;
-
-        HRESULT hr = CreateDeviceOnAdapterIndex(gpuId, &g_device, &g_context);
+        HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, &g_device, &g_context);
         if (FAILED(hr)) return -1;
 
-        hr = g_device->OpenSharedResource(inSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_inputTex.GetAddressOf());
+        hr = g_device->OpenSharedResource((HANDLE)inSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_inputTex.GetAddressOf());
         if (FAILED(hr)) return -2;
 
-        hr = g_device->OpenSharedResource(outSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_outputTex.GetAddressOf());
+        hr = g_device->OpenSharedResource((HANDLE)outSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_outputTex.GetAddressOf());
         if (FAILED(hr)) return -3;
 
-        // îOÇÃÇΩÇﬂÉtÉHÅ[É}ÉbÉgÅEÉTÉCÉYämîF
+        // Validate formats (IMPORTANT!)
         D3D11_TEXTURE2D_DESC inDesc{}, outDesc{};
         g_inputTex->GetDesc(&inDesc);
         g_outputTex->GetDesc(&outDesc);
 
-        if (inDesc.Width != outDesc.Width ||
-            inDesc.Height != outDesc.Height ||
-            inDesc.Format != outDesc.Format)
-            return -4;
+        if (inDesc.Width != outDesc.Width || inDesc.Height != outDesc.Height) return -4;
 
-        // CUDA device ëIë
-        int cr = CudaSetDeviceSafe(gpuId);
+        // Expect: input=R16_UINT, output=BGRA8
+        if (inDesc.Format != DXGI_FORMAT_R16_UINT) return -5;
+        if (outDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return -6;
+
+        g_w = (int)inDesc.Width;
+        g_h = (int)inDesc.Height;
+
+        // CUDA device select
+        int cr = CudaSetDeviceSafe((int)gpuId);
         if (cr != 0) return -1000 - cr;
 
-        // CUDA Ç… D3D11 texture Çìoò^
+        // Register D3D11 textures to CUDA
         cr = CudaRegisterD3D11Texture(g_inputTex.Get(), &g_cudaIn);
         if (cr != 0) return -1100 - cr;
 
         cr = CudaRegisterD3D11Texture(g_outputTex.Get(), &g_cudaOut);
         if (cr != 0) return -1200 - cr;
 
+        // default params
+        IPC_Params p{};
+        p.sizeBytes = sizeof(IPC_Params);
+        p.version = 1;
+        p.window = 4000;
+        p.level = 2000;
+        p.enableEdge = 0;
+        g_params = p;
 
-        D3D11_TEXTURE2D_DESC desc{};
-        g_inputTex->GetDesc(&desc);
-        g_w = (int)desc.Width;
-        g_h = (int)desc.Height;
-
-        return 0;
+        g_initialized.store(true);
+        return IPC_OK;
     }
 
-    int __cdecl IPC_SetParams(const IPC_Params* p)
+    int32_t __cdecl IPC_SetParams(const IPC_Params* p)
     {
-        if (!p || p->sizeBytes < sizeof(IPC_Params))
-            return -200;
+        int32_t v = ValidateParams(p);
+        if (v != IPC_OK) return v;
 
+        // Lightweight copy only (safe for frequent GUI updates)
         g_params = *p;
-        return 0;
+        return IPC_OK;
     }
 
-    //int __cdecl IPC_Execute()
-    //{
-    //    if (!g_context || !g_inputTex || !g_outputTex)
-    //        return -10;
-
-    //    // GPU è„Ç≈ input Å® output ÉRÉsÅ[
-    //    g_context->CopyResource(
-    //        g_outputTex.Get(),
-    //        g_inputTex.Get()
-    //    );
-
-    //    g_context->Flush(); // Åöí«â¡
-
-    //    return 0;
-    //}
-
-    int __cdecl IPC_Execute()
+    int32_t __cdecl IPC_Execute()
     {
-        if (!g_cudaIn || !g_cudaOut) return -20;
+        if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+        if (!g_cudaIn || !g_cudaOut) return IPC_ERR_NOT_INITIALIZED;
 
         void* inArr = nullptr;
         void* outArr = nullptr;
 
-        int cr = CudaMapGetArrays(g_cudaIn, g_cudaOut, &inArr, &outArr);
+        // Map and get arrays (keep mapped until after kernel)
+        int cr = CudaMapGetArraysMapped(g_cudaIn, g_cudaOut, &inArr, &outArr);
         if (cr != 0) return -1300 - cr;
 
-        // ÉpÉâÉÅÅ[É^ enableEdge ÇîΩâf
-        int enableEdge = 1;//g_params.enableEdge;
+        // Copy params locally (avoid race during execution)
+        IPC_Params p = g_params;
 
-        cr = CudaProcessArrays(inArr, outArr, g_w, g_h, enableEdge);
+        // Run kernel
+        cr = CudaProcessArrays_R16_To_BGRA(inArr, outArr, g_w, g_h, p.window, p.level, p.enableEdge);
+
+        // Unmap resources Î∞òÎìúÏãúÂÆüË°å
+        int cr2 = CudaUnmapResources(g_cudaIn, g_cudaOut);
         if (cr != 0) return -1400 - cr;
+        if (cr2 != 0) return -1500 - cr2;
 
-        return 0;
+        return IPC_OK;
     }
 
-
-    int __cdecl IPC_Shutdown()
+    int32_t __cdecl IPC_Shutdown()
     {
-        CudaUnregister(g_cudaOut); g_cudaOut = nullptr;
-        CudaUnregister(g_cudaIn);  g_cudaIn = nullptr;
+        g_initialized.store(false);
 
-        // ä˘ë∂ÇÃD3Dâï˙
+        if (g_cudaOut) { CudaUnregister(g_cudaOut); g_cudaOut = nullptr; }
+        if (g_cudaIn) { CudaUnregister(g_cudaIn);  g_cudaIn = nullptr; }
+
         g_inputTex.Reset();
         g_outputTex.Reset();
         g_context.Reset();
         g_device.Reset();
-        return 0;
+
+        return IPC_OK;
     }
 
 } // extern "C"

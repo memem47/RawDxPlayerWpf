@@ -9,7 +9,6 @@
 
 extern "C" {
 
-    // 失敗時の原因切り分けがしやすいように、HRESULT相当ではなく int を返す（0=OK）
     enum IPC_Result : int32_t {
         IPC_OK = 0,
         IPC_ERR_INVALIDARG = 1,
@@ -17,49 +16,61 @@ extern "C" {
         IPC_ERR_INTERNAL = 3
     };
 
-    // パラメータ構造体（後で拡張しても ABI を壊しにくいように version/size を先頭に置く）
 #pragma pack(push, 1)
     struct IPC_Params
     {
         uint32_t sizeBytes;   // sizeof(IPC_Params)
         uint32_t version;     // 1
 
-        // 例：階調変換の window/level
+        // WL/WW
         int32_t window;
         int32_t level;
 
-        // 例：エッジ抽出ON/OFFなど（後で増やす）
+        // effect flags
         int32_t enableEdge;
 
-        int32_t reserved[8];  // 将来拡張用
+        int32_t reserved[8];
     };
 #pragma pack(pop)
 
-    // A: 初期化
+    // A: init (GPU id + shared handles)
     IPC_API int32_t IPC_Init(int32_t gpuId, void* inSharedHandle, void* outSharedHandle);
 
-    // B: パラメータ設定
+    // B: params
     IPC_API int32_t IPC_SetParams(const IPC_Params* p);
 
-    // C: 実行
+    // C: execute
     IPC_API int32_t IPC_Execute();
 
-    // D: 終了
+    // D: shutdown
     IPC_API int32_t IPC_Shutdown();
-
 }
 
-// CudaInterop.cu で定義した関数
+// ---- CudaInterop.cu exported functions ----
 struct cudaGraphicsResource;
-struct cudaArray;
 
 extern "C" int CudaSetDeviceSafe(int gpuId);
 extern "C" int CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes);
 extern "C" int CudaUnregister(cudaGraphicsResource* res);
-extern "C" int CudaMapGetArrays(
+
+// Map both resources and get mapped cudaArrays (resources remain mapped!)
+extern "C" int CudaMapGetArraysMapped(
     cudaGraphicsResource* inRes,
     cudaGraphicsResource* outRes,
     void** inArray,
     void** outArray);
 
-extern "C" int CudaProcessArrays(void* inArray, void* outArray, int w, int h, int enableEdge);
+// Unmap both resources (must be called after processing)
+extern "C" int CudaUnmapResources(
+    cudaGraphicsResource* inRes,
+    cudaGraphicsResource* outRes);
+
+// Process: in(R16_UINT array) -> out(BGRA array)
+extern "C" int CudaProcessArrays_R16_To_BGRA(
+    void* inArray,
+    void* outArray,
+    int w,
+    int h,
+    int window,
+    int level,
+    int enableEdge);
