@@ -55,27 +55,49 @@
 
                             <!-- Window -->
                             <TextBlock Text="Window (WW)" Margin="0,0,0,4"/>
-                            <DockPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
                                 <Slider x:Name="SlWindow"
+                                        Grid.Column="0"
                                         Minimum="1" Maximum="65535" Value="4000"
                                         TickFrequency="1000" IsSnapToTickEnabled="False"
                                         ValueChanged="SlWindow_ValueChanged"
-                                        VerticalAlignment="Center"/>
-                                <TextBox x:Name="TbWindow" Width="90" Margin="10,0,0,0"
-                                         Text="4000" LostFocus="TbWindow_LostFocus"/>
-                            </DockPanel>
+                                        VerticalAlignment="Center"
+                                        MinWidth="220"/>
+
+                                <TextBox x:Name="TbWindow"
+                                        Grid.Column="1"
+                                        Width="90" Margin="10,0,0,0"
+                                        Text="4000" LostFocus="TbWindow_LostFocus"/>
+                            </Grid>
+
 
                             <!-- Level -->
                             <TextBlock Text="Level (WL)" Margin="0,10,0,4"/>
-                            <DockPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
                                 <Slider x:Name="SlLevel"
-                                        Minimum="0" Maximum="65535" Value="2000"
-                                        TickFrequency="1000" IsSnapToTickEnabled="False"
-                                        ValueChanged="SlLevel_ValueChanged"
-                                        VerticalAlignment="Center"/>
-                                <TextBox x:Name="TbLevel" Width="90" Margin="10,0,0,0"
-                                         Text="2000" LostFocus="TbLevel_LostFocus"/>
-                            </DockPanel>
+                                          Grid.Column="0"
+                                          Minimum="0" Maximum="65535" Value="2000"
+                                          TickFrequency="1000" IsSnapToTickEnabled="False"
+                                          ValueChanged="SlLevel_ValueChanged"
+                                          VerticalAlignment="Center"
+                                          MinWidth="220"/>
+
+                                <TextBox x:Name="TbLevel"
+                                       Grid.Column="1"
+                                       Width="90" Margin="10,0,0,0"
+                                       Text="2000" LostFocus="TbLevel_LostFocus"/>
+                            </Grid>
+
 
                             <TextBlock Margin="0,10,0,0" Foreground="#666" TextWrapping="Wrap">
                                 DLL ON 時は、IPC_SetParams で渡した WL/WW を DLL 側で反映できます（次ステップで CUDA WL/WW を実装）。
