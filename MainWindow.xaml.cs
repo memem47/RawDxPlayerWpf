@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Windows;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.Windows.Media;
 
 namespace RawDxPlayerWpf
 {
@@ -28,6 +29,10 @@ namespace RawDxPlayerWpf
 
         private readonly IImageProcessor _processor = new NativeImageProcessor();
         private bool _dllInitialized;
+
+        // Save Result (step1)
+        // できれば間引き、保存上限、非同期化を追加
+        private string _outputDir;
 
         // params
         private int _window = 4000;
@@ -52,6 +57,9 @@ namespace RawDxPlayerWpf
 
             _uiReady = true; // ★ここで初期化完了
             UpdateStatus("Ready");
+
+            // とりえあず出力先フォルダ名を固定
+            _outputDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "output");
         }
 
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
@@ -185,7 +193,70 @@ namespace RawDxPlayerWpf
             _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgraOut, _seq.Width * 4, 0);
 
             TbStatus.Text = $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}";
+
+            // 保存
+            SaveFrameIfEnabled(bgraOut, _seq.Width, _seq.Height, _index);
         }
+        
+        private void SaveFrameIfEnabled(byte[] bgraOut, int width, int height, int frameIndex)
+        {
+            if (CbSaveOn?.IsChecked != true) return;
+            if (bgraOut == null || bgraOut.Length < width * height * 4) return;
+
+            try
+            {
+                Directory.CreateDirectory(_outputDir);
+
+                // 連番（わかりやすく固定桁）
+                string stem = $"frame_{frameIndex:D6}_proc";
+                string pngPath = Path.Combine(_outputDir, stem + ".png");
+                string rawPath = Path.Combine(_outputDir, stem + ".raw");
+
+                SaveBgraToPng(bgraOut, width, height, pngPath);
+                SaveBgraAsRaw16LittleEndian(bgraOut, width, height, rawPath);
+            }
+            catch (Exception ex)
+            {
+                // 毎フレームMessageBoxは地獄なのでステータスだけ更新
+                UpdateStatus($"Save failed: {ex.Message}");
+            }
+        }
+
+        private static void SaveBgraToPng(byte[] bgra, int width, int height, string outPath)
+        {
+            var bs = BitmapSource.Create(
+                width, height,
+                96, 96,
+                PixelFormats.Bgra32,
+                null,
+                bgra,
+                width * 4);
+
+            var enc = new PngBitmapEncoder();
+            enc.Frames.Add(BitmapFrame.Create(bs));
+            using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                enc.Save(fs);
+            }
+        }
+
+        private static void SaveBgraAsRaw16LittleEndian(byte[] bgra, int width, int height, string outPath)
+        {
+            int pixels = checked(width * height);
+            byte[] raw16 = new byte[pixels * 2];
+
+            for (int i = 0; i < pixels; i++)
+            {
+                // BGRAのB成分を灰度として使用（R=G=BなのでどれでもOK）
+                byte g8 = bgra[i * 4 + 0];
+                ushort v16 = (ushort)(g8 * 257); // 0..255 -> 0..65535
+                raw16[i * 2 + 0] = (byte)(v16 & 0xFF);
+                raw16[i * 2 + 1] = (byte)(v16 >> 8);
+            }
+
+            File.WriteAllBytes(outPath, raw16);
+        }
+        
 
 
         // ---- GUI events: Params ----

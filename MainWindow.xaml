@@ -25,6 +25,8 @@
                     <CheckBox x:Name="CbDllOn" Content="DLL (CUDA) ON"
                               Foreground="White" VerticalAlignment="Center"
                               Checked="CbDllOn_Checked" Unchecked="CbDllOn_Unchecked"/>
+                    <CheckBox x:Name="CbSaveOn" Content="Save Result"
+                              Foreground="White" VerticalAlignment="Center"/>
                 </StackPanel>
 
                 <Button Content="Reset Params" DockPanel.Dock="Right" Width="120"
