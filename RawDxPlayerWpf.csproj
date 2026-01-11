@@ -87,8 +87,8 @@
     <Compile Include="Processing\IImageProcessor.cs" />
     <Compile Include="Processing\NativeImageProc.cs" />
     <Compile Include="Processing\NativeImageProcessor.cs" />
-    <Compile Include="Raw\RawFrameReader.cs" />
-    <Compile Include="Raw\RawSequence.cs" />
+    <Compile Include="RawFrameReader.cs" />
+    <Compile Include="RawSequence.cs" />
     <Page Include="MainWindow.xaml">
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
