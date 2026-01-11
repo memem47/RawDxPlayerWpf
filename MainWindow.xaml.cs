@@ -4,6 +4,7 @@ using RawDxPlayerWpf.Processing;
 using RawDxPlayerWpf.Raw;
 using System;
 using System.IO;
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -13,6 +14,11 @@ namespace RawDxPlayerWpf
     public partial class MainWindow : Window
     {
         private readonly DispatcherTimer _timer = new DispatcherTimer();
+
+        // Perf (wall-clock time around _processor.Execute) : last 10 frames
+        private readonly double[] _execMs = new double[10];
+        private int _execMsCount = 0;
+        private int _execMsIndex = 0;
 
         private RawSequence _seq;
         private int _index;
@@ -158,13 +164,20 @@ namespace RawDxPlayerWpf
                 // ★注意：この段階では DLL 側がまだ BGRA input 前提の可能性が高いです。
                 // B(=DLL側R16対応)が終わるまで DLL ON は使わないのが安全です。
                 ApplyParamsToDll();
+                var sw = Stopwatch.StartNew();
                 _processor.Execute();
+                sw.Stop();
+
+                PushExecMs(sw.Elapsed.TotalMilliseconds);
+                UpdatePerfText();
             }
             else
             {
                 // ② DLL OFF の場合はCPUでWL/WWして output(BGRA) に書く
                 byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16, _seq.Width, _seq.Height, _window, _level);
                 _renderer.UploadOutputBgra(bgra);
+
+                // DLL OFF のときは perf を更新しない（必要ならここも計測可）
             }
 
             // ③ 出力を readback して表示
@@ -287,5 +300,32 @@ namespace RawDxPlayerWpf
         }
 
         private void UpdateStatus(string msg) => TbStatus.Text = msg;
+
+        private void PushExecMs(double ms)
+        {
+            _execMs[_execMsIndex] = ms;
+            _execMsIndex = (_execMsIndex + 1) % _execMs.Length;
+            _execMsCount = Math.Min(_execMsCount + 1, _execMs.Length);
+        }
+
+        private double GetAvgExecMs()
+        {
+            if (_execMsCount == 0) return 0;
+            double sum = 0;
+            for (int i = 0; i<_execMsCount; i++) sum += _execMs[i];
+            return sum / _execMsCount;
+        }
+
+        private void UpdatePerfText()
+        {
+            double avg = GetAvgExecMs();
+            if (avg <= 0)
+            {
+                TbCudaMs.Text = "CUDA avg(10): -";
+                return;
+            }
+            double fps = 1000.0 / avg;
+            TbCudaMs.Text = $"CUDA avg(10): {avg:F2} ms  ({fps:F1} fps)";
+        }
     }
 }

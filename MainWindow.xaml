@@ -122,6 +122,9 @@
             <StatusBarItem>
                 <TextBlock x:Name="TbStatus" Text="Ready"/>
             </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock x:Name="TbCudaMs" Text="CUDA avg(10): -" />
+            </StatusBarItem>
         </StatusBar>
 
     </Grid>
