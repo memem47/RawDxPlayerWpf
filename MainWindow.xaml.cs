@@ -1,80 +1,80 @@
-﻿using System;
-using System.IO;
-using System.Linq;
-using System.Windows;
-using System.Windows.Threading;
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using RawDxPlayerWpf.Dx;
 using RawDxPlayerWpf.Processing;
 using RawDxPlayerWpf.Raw;
-using System.Windows.Media;
+using System;
+using System.IO;
+using System.Windows;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 
 namespace RawDxPlayerWpf
 {
     public partial class MainWindow : Window
     {
         private readonly DispatcherTimer _timer = new DispatcherTimer();
+
         private RawSequence _seq;
         private int _index;
 
         private DxRenderer _renderer;
-        private D3DImageHost _d3dImageHost;
-
-        // CUDA DLL 呼び出し実装
-        private IImageProcessor _processor = new NativeImageProcessor();
         private WriteableBitmap _wb;
-        
-        // Phase 2-1: DLLはまだ output を書かないので、WPF側で input->output copy する
-        private bool _processorWritesOutput = false;
-        
+
+        private readonly IImageProcessor _processor = new NativeImageProcessor();
+        private bool _dllInitialized;
+
+        // params
+        private int _window = 4000;
+        private int _level = 2000;
+        private int _enableEdge = 0;
+
+        private bool _suppressParamEvents;
+
+        private bool _uiReady = false;
+
         public MainWindow()
         {
             InitializeComponent();
-
             _timer.Tick += (_, __) => RenderNextFrame();
         }
 
         private void Window_Loaded(object sender, RoutedEventArgs e)
         {
+            _suppressParamEvents = true;
+            SyncGuiFromParams();
+            _suppressParamEvents = false;
+
+            _uiReady = true; // ★ここで初期化完了
             UpdateStatus("Ready");
         }
 
-
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
-            _processor?.Shutdown();
-
             StopPlayback();
+
+            try
+            {
+                if (_dllInitialized)
+                {
+                    _processor.Shutdown();
+                    _dllInitialized = false;
+                }
+            }
+            catch { /* ignore */ }
+
             _renderer?.Dispose();
-            _d3dImageHost?.Dispose();
         }
 
         private void BtnOpen_Click(object sender, RoutedEventArgs e)
         {
-            var lastPath = Properties.Settings.Default.LastOpenedFile;
-            string initDir = null;
-            string initFile = null;
-
-            if (!string.IsNullOrWhiteSpace(lastPath) && File.Exists(lastPath))
-            {
-                initDir = Path.GetDirectoryName(lastPath);
-                initFile = Path.GetFileName(lastPath);
-            }
-
             var dlg = new OpenFileDialog
             {
                 Title = "RAWフォルダ内の任意のRAW/BINファイルを選択してください",
                 Filter = "RAW/BIN files (*.raw;*.bin)|*.raw;*.bin",
-                CheckFileExists = true,
-                InitialDirectory = initDir,
-                FileName = initFile ?? ""
+                CheckFileExists = true
             };
 
             if (dlg.ShowDialog() != true) return;
-
-            Properties.Settings.Default.LastOpenedFile = dlg.FileName;
-            Properties.Settings.Default.Save();
 
             LoadSequenceFromFile(dlg.FileName);
         }
@@ -86,33 +86,29 @@ namespace RawDxPlayerWpf
             _seq = RawSequence.FromAnyFileInFolder(filePath);
             _index = 0;
 
-            // Rendererを作り直す（サイズ変わる可能性があるため）
+            // renderer / writeablebitmap
             _renderer?.Dispose();
-            int gpuId = 0;
-            _renderer = new DxRenderer(_seq.Width, _seq.Height, gpuId);
-            
-            // ②のための初期化枠（今は _processor=null なので呼ばれない）
-            if (_processor != null)
-            {
-                _processor.Initialize(gpuId, _renderer.InputSharedHandle, _renderer.OutputSharedHandle);
+            _renderer = new DxRenderer(_seq.Width, _seq.Height, gpuId: 0);
 
-                // パラメータセット（window/levelと、edgeは一旦OFF）
-                var p = NativeImageProc.MakeDefaultParams(window: 30000, level: 30000, enableEdge: 0);
-                _processor.SetParameters(p);
-            }
-            
-            // WPF表示用の WriteableBitmap を作成
-            _wb = new WriteableBitmap(
-                _seq.Width, _seq.Height,
-                96, 96,
-                PixelFormats.Bgra32,
-                null);
-
+            _wb = new WriteableBitmap(_seq.Width, _seq.Height, 96, 96,
+                System.Windows.Media.PixelFormats.Bgra32, null);
             ImgView.Source = _wb;
 
-            UpdateStatus($"Loaded: {_seq.Files.Count} frames, {_seq.Width}x{_seq.Height}, folder={_seq.Folder}");
+            // init dll
+            try
+            {
+                int gpuId = 0;
+                _processor.Initialize(gpuId, _renderer.InputSharedHandle, _renderer.OutputSharedHandle);
+                _dllInitialized = true;
+                ApplyParamsToDll();
+            }
+            catch (Exception ex)
+            {
+                _dllInitialized = false;
+                UpdateStatus($"DLL init failed: {ex.Message}");
+            }
 
-            // 1枚目表示
+            UpdateStatus($"Loaded: {_seq.Files.Count} frames, {_seq.Width}x{_seq.Height}");
             RenderNextFrame(forceSameIndex: true);
         }
 
@@ -149,42 +145,143 @@ namespace RawDxPlayerWpf
                 if (_index >= _seq.Files.Count) _index = 0;
             }
 
-            var path = _seq.Files[_index];
+            string path = _seq.Files[_index];
 
-            // Window/Level（簡易：16bit→8bitに落として表示）
-            int window = ParseOrDefault(TbWindow.Text, 4000);
-            int level = ParseOrDefault(TbLevel.Text, 2000);
+            // 現状は CPU で WL/WW して BGRA を作って input に upload
+            byte[] bgra = RawFrameReader.Load16ToBgra8(path, _seq.Width, _seq.Height, _window, _level);
+            _renderer.UploadInputBgra(bgra);
 
-            // 16bit→BGRA（CPU）
-            var bgraIn = RawFrameReader.Load16ToBgra8(path, _seq.Width, _seq.Height, window, level);
-
-            // ① 入力テクスチャ更新（DX側）
-            _renderer.UploadInputBgra(bgraIn);
-
-            // DLL処理ON/OFF
             bool dllOn = (CbDllOn.IsChecked == true);
 
-            if (dllOn && _processor != null)
+            if (dllOn && _dllInitialized)
             {
-                // DLLが outputTexture を更新する（Phase 2-2ではin->out copy）
+                // GUI変更を DLL へ反映（軽ければ毎フレームでもOK）
+                ApplyParamsToDll();
                 _processor.Execute();
             }
             else
             {
-                // DLL処理OFF：WPF側で input -> output へコピー（表示を保証）
+                // DLL OFF: input を output にコピーして表示
                 _renderer.PassthroughCopyInputToOutput();
             }
 
-            // ③ 出力を readback して表示
-            var bgraOut = _renderer.ReadbackOutputBgra();
+            // output readback -> WriteableBitmap
+            byte[] bgraOut = _renderer.ReadbackOutputBgra();
             _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgraOut, _seq.Width * 4, 0);
-
 
             TbStatus.Text = $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}";
         }
 
-        private static int ParseOrDefault(string s, int def)
-            => int.TryParse(s, out var v) ? v : def;
+        // ---- GUI events: Params ----
+
+        private void BtnResetParams_Click(object sender, RoutedEventArgs e)
+        {
+            _window = 4000;
+            _level = 2000;
+            _enableEdge = 0;
+            SyncGuiFromParams();
+            ApplyParamsToDll();
+
+            if (_seq != null) RenderNextFrame(forceSameIndex: true);
+        }
+
+        private void CbDllOn_Checked(object sender, RoutedEventArgs e)
+        {
+            ApplyParamsToDll();
+            if (_seq != null) RenderNextFrame(forceSameIndex: true);
+        }
+
+        private void CbDllOn_Unchecked(object sender, RoutedEventArgs e)
+        {
+            if (_seq != null) RenderNextFrame(forceSameIndex: true);
+        }
+
+        private void CbEdge_Checked(object sender, RoutedEventArgs e)
+        {
+            _enableEdge = 1;
+            ApplyParamsToDll();
+        }
+
+        private void CbEdge_Unchecked(object sender, RoutedEventArgs e)
+        {
+            _enableEdge = 0;
+            ApplyParamsToDll();
+        }
+
+        // Slider -> TextBox
+        private void SlWindow_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (!_uiReady) return;            // ★追加
+            if (_suppressParamEvents) return;
+
+            _window = (int)Math.Round(SlWindow.Value);
+            if (TbWindow != null) TbWindow.Text = _window.ToString();
+            ApplyParamsToDll();
+        }
+
+        private void SlLevel_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (!_uiReady) return;            // ★追加
+            if (_suppressParamEvents) return;
+            _level = (int)Math.Round(SlLevel.Value);
+            if (TbLevel != null) TbLevel.Text = _level.ToString();
+            ApplyParamsToDll();
+        }
+
+        // TextBox -> Slider（入力確定）
+        private void TbWindow_LostFocus(object sender, RoutedEventArgs e)
+        {
+            if (!int.TryParse(TbWindow.Text, out int v)) v = _window;
+            v = Math.Max(1, Math.Min(65535, v));
+            _window = v;
+
+            _suppressParamEvents = true;
+            SlWindow.Value = _window;
+            _suppressParamEvents = false;
+
+            ApplyParamsToDll();
+        }
+
+        private void TbLevel_LostFocus(object sender, RoutedEventArgs e)
+        {
+            if (!int.TryParse(TbLevel.Text, out int v)) v = _level;
+            v = Math.Max(0, Math.Min(65535, v));
+            _level = v;
+
+            _suppressParamEvents = true;
+            SlLevel.Value = _level;
+            _suppressParamEvents = false;
+
+            ApplyParamsToDll();
+        }
+
+        private void SyncGuiFromParams()
+        {
+            _suppressParamEvents = true;
+
+            SlWindow.Value = _window;
+            SlLevel.Value = _level;
+            TbWindow.Text = _window.ToString();
+            TbLevel.Text = _level.ToString();
+            CbEdge.IsChecked = (_enableEdge != 0);
+
+            _suppressParamEvents = false;
+        }
+
+        private void ApplyParamsToDll()
+        {
+            if (!_dllInitialized) return;
+
+            try
+            {
+                var p = NativeImageProc.MakeDefaultParams(window: _window, level: _level, enableEdge: _enableEdge);
+                _processor.SetParameters(p);
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"IPC_SetParams failed: {ex.Message}");
+            }
+        }
 
         private void UpdateStatus(string msg) => TbStatus.Text = msg;
     }

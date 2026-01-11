@@ -1,8 +1,9 @@
 ﻿<Window x:Class="RawDxPlayerWpf.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="RawDxPlayerWpf" Width="1100" Height="800"
+        Title="RawDxPlayerWpf" Width="1200" Height="800"
         Loaded="Window_Loaded" Closing="Window_Closing">
+
     <Grid>
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -10,35 +11,96 @@
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <DockPanel Margin="8" LastChildFill="False">
-            <Button Content="Open..." Width="90" Margin="0,0,8,0" Click="BtnOpen_Click"/>
-            <Button Content="Play" Width="90" Margin="0,0,8,0" Click="BtnPlay_Click"/>
-            <Button Content="Stop" Width="90" Margin="0,0,8,0" Click="BtnStop_Click"/>
+        <!-- Top bar -->
+        <Border Grid.Row="0" Background="#202225" Padding="8">
+            <DockPanel LastChildFill="False">
+                <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
+                    <Button Content="Open..." Width="90" Margin="0,0,8,0" Click="BtnOpen_Click"/>
+                    <Button Content="Play" Width="90" Margin="0,0,8,0" Click="BtnPlay_Click"/>
+                    <Button Content="Stop" Width="90" Margin="0,0,16,0" Click="BtnStop_Click"/>
 
-            <TextBlock VerticalAlignment="Center" Margin="12,0,6,0" Text="FPS:"/>
-            <TextBox x:Name="TbFps" Width="60" Text="30" Margin="0,0,12,0"/>
+                    <TextBlock Text="FPS" Foreground="White" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox x:Name="TbFps" Width="60" Text="30" Margin="0,0,16,0"/>
 
-            <TextBlock VerticalAlignment="Center" Margin="12,0,6,0" Text="Window:"/>
-            <TextBox x:Name="TbWindow" Width="80" Text="30000" Margin="0,0,12,0"/>
+                    <CheckBox x:Name="CbDllOn" Content="DLL (CUDA) ON"
+                              Foreground="White" VerticalAlignment="Center"
+                              Checked="CbDllOn_Checked" Unchecked="CbDllOn_Unchecked"/>
+                </StackPanel>
 
-            <TextBlock VerticalAlignment="Center" Margin="12,0,6,0" Text="Level:"/>
-            <TextBox x:Name="TbLevel" Width="80" Text="30000"/>
-
-            <CheckBox x:Name="CbDllOn"
-                      Content="DLL processing"
-                      IsChecked="True"
-                      VerticalAlignment="Center"
-                      Margin="12,0,0,0"/>
-        </DockPanel>
-
-        <Border Grid.Row="1" Margin="8" BorderBrush="Gray" BorderThickness="1">
-            <Image x:Name="ImgView" Stretch="Uniform" SnapsToDevicePixels="True"/>
+                <Button Content="Reset Params" DockPanel.Dock="Right" Width="120"
+                        Click="BtnResetParams_Click"/>
+            </DockPanel>
         </Border>
 
+        <!-- Main area -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="360"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Left: Image -->
+            <Border Grid.Column="0" Margin="8" BorderBrush="#3A3D41" BorderThickness="1" Background="Black">
+                <Viewbox Stretch="Uniform">
+                    <Image x:Name="ImgView" Stretch="None" SnapsToDevicePixels="True"/>
+                </Viewbox>
+            </Border>
+
+            <!-- Right: Parameters -->
+            <ScrollViewer Grid.Column="1" Margin="8" VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+
+                    <GroupBox Header="WL / WW" Margin="0,0,0,10">
+                        <StackPanel Margin="10">
+
+                            <!-- Window -->
+                            <TextBlock Text="Window (WW)" Margin="0,0,0,4"/>
+                            <DockPanel>
+                                <Slider x:Name="SlWindow"
+                                        Minimum="1" Maximum="65535" Value="4000"
+                                        TickFrequency="1000" IsSnapToTickEnabled="False"
+                                        ValueChanged="SlWindow_ValueChanged"
+                                        VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbWindow" Width="90" Margin="10,0,0,0"
+                                         Text="4000" LostFocus="TbWindow_LostFocus"/>
+                            </DockPanel>
+
+                            <!-- Level -->
+                            <TextBlock Text="Level (WL)" Margin="0,10,0,4"/>
+                            <DockPanel>
+                                <Slider x:Name="SlLevel"
+                                        Minimum="0" Maximum="65535" Value="2000"
+                                        TickFrequency="1000" IsSnapToTickEnabled="False"
+                                        ValueChanged="SlLevel_ValueChanged"
+                                        VerticalAlignment="Center"/>
+                                <TextBox x:Name="TbLevel" Width="90" Margin="10,0,0,0"
+                                         Text="2000" LostFocus="TbLevel_LostFocus"/>
+                            </DockPanel>
+
+                            <TextBlock Margin="0,10,0,0" Foreground="#666" TextWrapping="Wrap">
+                                DLL ON 時は、IPC_SetParams で渡した WL/WW を DLL 側で反映できます（次ステップで CUDA WL/WW を実装）。
+                                DLL OFF 時は、現在は CPU で WL/WW を適用して表示しています。
+                            </TextBlock>
+                        </StackPanel>
+                    </GroupBox>
+
+                    <GroupBox Header="Effects" Margin="0,0,0,10">
+                        <StackPanel Margin="10">
+                            <CheckBox x:Name="CbEdge" Content="Enable Edge"
+                                      Checked="CbEdge_Checked" Unchecked="CbEdge_Unchecked"/>
+                        </StackPanel>
+                    </GroupBox>
+
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+
+        <!-- Status bar -->
         <StatusBar Grid.Row="2">
             <StatusBarItem>
                 <TextBlock x:Name="TbStatus" Text="Ready"/>
             </StatusBarItem>
         </StatusBar>
+
     </Grid>
 </Window>
