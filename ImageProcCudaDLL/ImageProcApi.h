@@ -48,3 +48,18 @@ extern "C" {
     IPC_API int32_t IPC_Shutdown();
 
 }
+
+// CudaInterop.cu Ç≈íËã`ÇµÇΩä÷êî
+struct cudaGraphicsResource;
+struct cudaArray;
+
+extern "C" int CudaSetDeviceSafe(int gpuId);
+extern "C" int CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes);
+extern "C" int CudaUnregister(cudaGraphicsResource* res);
+extern "C" int CudaMapGetArrays(
+    cudaGraphicsResource* inRes,
+    cudaGraphicsResource* outRes,
+    void** inArray,
+    void** outArray);
+
+extern "C" int CudaProcessArrays(void* inArray, void* outArray, int w, int h, int enableEdge);

@@ -7,6 +7,12 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 
+#include <cuda_runtime.h>
+#include <cuda_d3d11_interop.h>
+
+static cudaGraphicsResource* g_cudaIn = nullptr;
+static cudaGraphicsResource* g_cudaOut = nullptr;
+
 using Microsoft::WRL::ComPtr;
 
 static ComPtr<ID3D11Device>        g_device;
@@ -18,6 +24,8 @@ static ComPtr<ID3D11Texture2D>     g_outputTex;
 static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
 static std::mutex g_mtx;
+
+static int g_w = 0, g_h = 0;
 
 static int32_t ValidateParams(const IPC_Params* p)
 {
@@ -88,6 +96,23 @@ extern "C" {
             inDesc.Format != outDesc.Format)
             return -4;
 
+        // CUDA device 選択
+        int cr = CudaSetDeviceSafe(gpuId);
+        if (cr != 0) return -1000 - cr;
+
+        // CUDA に D3D11 texture を登録
+        cr = CudaRegisterD3D11Texture(g_inputTex.Get(), &g_cudaIn);
+        if (cr != 0) return -1100 - cr;
+
+        cr = CudaRegisterD3D11Texture(g_outputTex.Get(), &g_cudaOut);
+        if (cr != 0) return -1200 - cr;
+
+
+        D3D11_TEXTURE2D_DESC desc{};
+        g_inputTex->GetDesc(&desc);
+        g_w = (int)desc.Width;
+        g_h = (int)desc.Height;
+
         return 0;
     }
 
@@ -100,24 +125,48 @@ extern "C" {
         return 0;
     }
 
+    //int __cdecl IPC_Execute()
+    //{
+    //    if (!g_context || !g_inputTex || !g_outputTex)
+    //        return -10;
+
+    //    // GPU 上で input → output コピー
+    //    g_context->CopyResource(
+    //        g_outputTex.Get(),
+    //        g_inputTex.Get()
+    //    );
+
+    //    g_context->Flush(); // ★追加
+
+    //    return 0;
+    //}
+
     int __cdecl IPC_Execute()
     {
-        if (!g_context || !g_inputTex || !g_outputTex)
-            return -10;
+        if (!g_cudaIn || !g_cudaOut) return -20;
 
-        // GPU 上で input → output コピー
-        g_context->CopyResource(
-            g_outputTex.Get(),
-            g_inputTex.Get()
-        );
+        void* inArr = nullptr;
+        void* outArr = nullptr;
 
-        g_context->Flush(); // ★追加
+        int cr = CudaMapGetArrays(g_cudaIn, g_cudaOut, &inArr, &outArr);
+        if (cr != 0) return -1300 - cr;
+
+        // パラメータ enableEdge を反映
+        int enableEdge = 1;//g_params.enableEdge;
+
+        cr = CudaProcessArrays(inArr, outArr, g_w, g_h, enableEdge);
+        if (cr != 0) return -1400 - cr;
 
         return 0;
     }
 
+
     int __cdecl IPC_Shutdown()
     {
+        CudaUnregister(g_cudaOut); g_cudaOut = nullptr;
+        CudaUnregister(g_cudaIn);  g_cudaIn = nullptr;
+
+        // 既存のD3D解放
         g_inputTex.Reset();
         g_outputTex.Reset();
         g_context.Reset();

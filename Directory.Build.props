@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- Force MSVC toolset version used by MSBuild (and CUDA.targets) -->
+    <VCToolsVersion>14.36.32532</VCToolsVersion>
+  </PropertyGroup>
+</Project>
