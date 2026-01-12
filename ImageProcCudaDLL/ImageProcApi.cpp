@@ -8,10 +8,11 @@
 #include <atomic>
 #include <mutex>
 
+using Microsoft::WRL::ComPtr;
+
+// CUDA headers only in implementation
 #include <cuda_runtime.h>
 #include <cuda_d3d11_interop.h>
-
-using Microsoft::WRL::ComPtr;
 
 static cudaGraphicsResource* g_cudaIn = nullptr;
 static cudaGraphicsResource* g_cudaOut = nullptr;
@@ -25,7 +26,8 @@ static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
 static std::mutex g_mtx;
 
-static int g_w = 0, g_h = 0;
+static int g_w = 0;
+static int g_h = 0;
 
 static int32_t ValidateParams(const IPC_Params* p)
 {
@@ -47,18 +49,27 @@ static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11D
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-    D3D_FEATURE_LEVEL fl;
-    return D3D11CreateDevice(
+    static const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0
+    };
+    D3D_FEATURE_LEVEL outLevel = D3D_FEATURE_LEVEL_11_0;
+
+    hr = D3D11CreateDevice(
         adapter.Get(),
         D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
         flags,
-        nullptr, 0,
+        levels,
+        (UINT)_countof(levels),
         D3D11_SDK_VERSION,
         dev,
-        &fl,
-        ctx
-    );
+        &outLevel,
+        ctx);
+
+    return hr;
 }
 
 extern "C" {
@@ -70,7 +81,7 @@ extern "C" {
         // reset
         IPC_Shutdown();
 
-        HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, &g_device, &g_context);
+        HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, g_device.GetAddressOf(), g_context.GetAddressOf());
         if (FAILED(hr)) return -1;
 
         hr = g_device->OpenSharedResource((HANDLE)inSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_inputTex.GetAddressOf());
@@ -86,18 +97,17 @@ extern "C" {
 
         if (inDesc.Width != outDesc.Width || inDesc.Height != outDesc.Height) return -4;
 
-        // Expect: input=R16_UINT, output=BGRA8
+        // Expect: input=R16_UINT, output=R16_UINT
         if (inDesc.Format != DXGI_FORMAT_R16_UINT) return -5;
-        if (outDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return -6;
+        if (outDesc.Format != DXGI_FORMAT_R16_UINT) return -6;
 
         g_w = (int)inDesc.Width;
         g_h = (int)inDesc.Height;
 
-        // CUDA device select
+        // CUDA device
         int cr = CudaSetDeviceSafe((int)gpuId);
         if (cr != 0) return -1000 - cr;
 
-        // Register D3D11 textures to CUDA
         cr = CudaRegisterD3D11Texture(g_inputTex.Get(), &g_cudaIn);
         if (cr != 0) return -1100 - cr;
 
@@ -121,8 +131,9 @@ extern "C" {
     {
         int32_t v = ValidateParams(p);
         if (v != IPC_OK) return v;
+        if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
 
-        // Lightweight copy only (safe for frequent GUI updates)
+        std::lock_guard<std::mutex> lk(g_mtx);
         g_params = *p;
         return IPC_OK;
     }
@@ -130,26 +141,25 @@ extern "C" {
     int32_t __cdecl IPC_Execute()
     {
         if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
-        if (!g_cudaIn || !g_cudaOut) return IPC_ERR_NOT_INITIALIZED;
+
+        IPC_Params p;
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            p = g_params;
+        }
 
         void* inArr = nullptr;
         void* outArr = nullptr;
 
-        // Map and get arrays (keep mapped until after kernel)
         int cr = CudaMapGetArraysMapped(g_cudaIn, g_cudaOut, &inArr, &outArr);
-        if (cr != 0) return -1300 - cr;
+        if (cr != 0) return -2000 - cr;
 
-        // Copy params locally (avoid race during execution)
-        IPC_Params p = g_params;
+        cr = CudaProcessArrays_R16_To_R16(inArr, outArr, g_w, g_h, p.window, p.level, p.enableEdge);
 
-        // Run kernel
-        cr = CudaProcessArrays_R16_To_BGRA(inArr, outArr, g_w, g_h, p.window, p.level, p.enableEdge);
+        int ur = CudaUnmapResources(g_cudaIn, g_cudaOut);
+        if (ur != 0) return -2100 - ur;
 
-        // Unmap resources 반드시実行
-        int cr2 = CudaUnmapResources(g_cudaIn, g_cudaOut);
-        if (cr != 0) return -1400 - cr;
-        if (cr2 != 0) return -1500 - cr2;
-
+        if (cr != 0) return -2200 - cr;
         return IPC_OK;
     }
 
@@ -164,6 +174,9 @@ extern "C" {
         g_outputTex.Reset();
         g_context.Reset();
         g_device.Reset();
+
+        g_w = 0;
+        g_h = 0;
 
         return IPC_OK;
     }

@@ -30,18 +30,15 @@ namespace RawDxPlayerWpf
         private readonly IImageProcessor _processor = new NativeImageProcessor();
         private bool _dllInitialized;
 
-        // Save Result (step1)
-        // できれば間引き、保存上限、非同期化を追加
-        private string _outputDir;
-
         // params
         private int _window = 4000;
         private int _level = 2000;
         private int _enableEdge = 0;
 
         private bool _suppressParamEvents;
-
         private bool _uiReady = false;
+
+        private string _outputDir;
 
         public MainWindow()
         {
@@ -58,7 +55,6 @@ namespace RawDxPlayerWpf
             _uiReady = true; // ★ここで初期化完了
             UpdateStatus("Ready");
 
-            // とりえあず出力先フォルダ名を固定
             _outputDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "output");
         }
 
@@ -149,6 +145,13 @@ namespace RawDxPlayerWpf
             if (_seq != null) UpdateStatus("Stopped.");
         }
 
+        /// <summary>
+        /// Render pipeline (true 16-bit):
+        /// 1) Load RAW16 -> upload to Input(R16)
+        /// 2) If DLL ON: DLL processes Input(R16) -> Output(R16)
+        ///    Else: copy Input(R16) -> Output(R16)
+        /// 3) Readback Output(R16) -> CPU WL/WW -> BGRA8 -> display
+        /// </summary>
         private void RenderNextFrame(bool forceSameIndex = false)
         {
             if (_seq == null || _renderer == null) return;
@@ -162,18 +165,17 @@ namespace RawDxPlayerWpf
             string path = _seq.Files[_index];
 
             // ① RAW16をそのまま読み込んで input(R16) に upload
-            byte[] raw16 = RawFrameReader.Load16RawBytes(path, _seq.Width, _seq.Height);
-            _renderer.UploadInputRaw16(raw16);
+            byte[] raw16In = RawFrameReader.Load16RawBytes(path, _seq.Width, _seq.Height);
+            _renderer.UploadInputRaw16(raw16In);
 
             bool dllOn = (CbDllOn.IsChecked == true);
 
             if (dllOn && _dllInitialized)
             {
-                // ★注意：この段階では DLL 側がまだ BGRA input 前提の可能性が高いです。
-                // B(=DLL側R16対応)が終わるまで DLL ON は使わないのが安全です。
                 ApplyParamsToDll();
+
                 var sw = Stopwatch.StartNew();
-                _processor.Execute();
+                _processor.Execute(); // in(R16) -> out(R16) in CUDA
                 sw.Stop();
 
                 PushExecMs(sw.Elapsed.TotalMilliseconds);
@@ -181,83 +183,21 @@ namespace RawDxPlayerWpf
             }
             else
             {
-                // ② DLL OFF の場合はCPUでWL/WWして output(BGRA) に書く
-                byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16, _seq.Width, _seq.Height, _window, _level);
-                _renderer.UploadOutputBgra(bgra);
-
-                // DLL OFF のときは perf を更新しない（必要ならここも計測可）
+                // DLL OFF: input(R16) -> output(R16) passthrough
+                _renderer.CopyInputToOutput();
+                // perf not updated
             }
 
-            // ③ 出力を readback して表示
-            var bgraOut = _renderer.ReadbackOutputBgra();
-            _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgraOut, _seq.Width * 4, 0);
+            // ③ 出力(raw16)を readback して、CPUでWL/WWし表示
+            byte[] raw16Out = _renderer.ReadbackOutputRaw16();
+            byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16Out, _seq.Width, _seq.Height, _window, _level);
+
+            _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgra, _seq.Width * 4, 0);
 
             TbStatus.Text = $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}";
 
-            // 保存
-            SaveFrameIfEnabled(bgraOut, _seq.Width, _seq.Height, _index);
+            SaveFrameIfEnabled(raw16Out, bgra, _seq.Width, _seq.Height, _index);
         }
-        
-        private void SaveFrameIfEnabled(byte[] bgraOut, int width, int height, int frameIndex)
-        {
-            if (CbSaveOn?.IsChecked != true) return;
-            if (bgraOut == null || bgraOut.Length < width * height * 4) return;
-
-            try
-            {
-                Directory.CreateDirectory(_outputDir);
-
-                // 連番（わかりやすく固定桁）
-                string stem = $"frame_{frameIndex:D6}_proc";
-                string pngPath = Path.Combine(_outputDir, stem + ".png");
-                string rawPath = Path.Combine(_outputDir, stem + ".raw");
-
-                SaveBgraToPng(bgraOut, width, height, pngPath);
-                SaveBgraAsRaw16LittleEndian(bgraOut, width, height, rawPath);
-            }
-            catch (Exception ex)
-            {
-                // 毎フレームMessageBoxは地獄なのでステータスだけ更新
-                UpdateStatus($"Save failed: {ex.Message}");
-            }
-        }
-
-        private static void SaveBgraToPng(byte[] bgra, int width, int height, string outPath)
-        {
-            var bs = BitmapSource.Create(
-                width, height,
-                96, 96,
-                PixelFormats.Bgra32,
-                null,
-                bgra,
-                width * 4);
-
-            var enc = new PngBitmapEncoder();
-            enc.Frames.Add(BitmapFrame.Create(bs));
-            using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                enc.Save(fs);
-            }
-        }
-
-        private static void SaveBgraAsRaw16LittleEndian(byte[] bgra, int width, int height, string outPath)
-        {
-            int pixels = checked(width * height);
-            byte[] raw16 = new byte[pixels * 2];
-
-            for (int i = 0; i < pixels; i++)
-            {
-                // BGRAのB成分を灰度として使用（R=G=BなのでどれでもOK）
-                byte g8 = bgra[i * 4 + 0];
-                ushort v16 = (ushort)(g8 * 257); // 0..255 -> 0..65535
-                raw16[i * 2 + 0] = (byte)(v16 & 0xFF);
-                raw16[i * 2 + 1] = (byte)(v16 >> 8);
-            }
-
-            File.WriteAllBytes(outPath, raw16);
-        }
-        
-
 
         // ---- GUI events: Params ----
 
@@ -298,7 +238,7 @@ namespace RawDxPlayerWpf
         // Slider -> TextBox
         private void SlWindow_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (!_uiReady) return;            // ★追加
+            if (!_uiReady) return;
             if (_suppressParamEvents) return;
 
             _window = (int)Math.Round(SlWindow.Value);
@@ -308,8 +248,9 @@ namespace RawDxPlayerWpf
 
         private void SlLevel_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (!_uiReady) return;            // ★追加
+            if (!_uiReady) return;
             if (_suppressParamEvents) return;
+
             _level = (int)Math.Round(SlLevel.Value);
             if (TbLevel != null) TbLevel.Text = _level.ToString();
             ApplyParamsToDll();
@@ -383,7 +324,7 @@ namespace RawDxPlayerWpf
         {
             if (_execMsCount == 0) return 0;
             double sum = 0;
-            for (int i = 0; i<_execMsCount; i++) sum += _execMs[i];
+            for (int i = 0; i < _execMsCount; i++) sum += _execMs[i];
             return sum / _execMsCount;
         }
 
@@ -397,6 +338,55 @@ namespace RawDxPlayerWpf
             }
             double fps = 1000.0 / avg;
             TbCudaMs.Text = $"CUDA avg(10): {avg:F2} ms  ({fps:F1} fps)";
+        }
+
+
+        // ---- Save (true 16-bit RAW + display PNG) ----
+
+        private void SaveFrameIfEnabled(byte[] raw16Out, byte[] bgraForPng, int width, int height, int frameIndex)
+        {
+            if (CbSaveOn?.IsChecked != true) return;
+            if (raw16Out == null || raw16Out.Length < width * height * 2) return;
+            if (bgraForPng == null || bgraForPng.Length < width * height * 4) return;
+
+            try
+            {
+                Directory.CreateDirectory(_outputDir);
+
+                // 同名上書きになるのが嫌なら、日時や元ファイル名も混ぜてください
+                string stem = $"frame_{frameIndex:D6}";
+                string rawPath = Path.Combine(_outputDir, stem + "_proc16.raw");
+                string pngPath = Path.Combine(_outputDir, stem + "_view.png");
+
+                // RAW：真の16bit（R16出力をそのまま）
+                File.WriteAllBytes(rawPath, raw16Out);
+
+                // PNG：表示用（WL/WW後のBGRA8）
+                SaveBgraToPng(bgraForPng, width, height, pngPath);
+            }
+            catch (Exception ex)
+            {
+                // 毎フレームMessageBoxは危険なので、ステータスだけ
+                UpdateStatus($"Save failed: {ex.Message}");
+            }
+        }
+
+        private static void SaveBgraToPng(byte[] bgra, int width, int height, string outPath)
+        {
+            var bs = BitmapSource.Create(
+                width, height,
+                96, 96,
+                PixelFormats.Bgra32,
+                null,
+                bgra,
+                width * 4);
+
+            var enc = new PngBitmapEncoder();
+            enc.Frames.Add(BitmapFrame.Create(bs));
+            using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                enc.Save(fs);
+            }
         }
     }
 }

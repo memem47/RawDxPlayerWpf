@@ -71,44 +71,37 @@ extern "C" int CudaUnmapResources(cudaGraphicsResource* inRes, cudaGraphicsResou
 
 // ----------------- kernels -----------------
 
-__device__ __forceinline__ unsigned char wlww_to_u8(unsigned short v, int window, int level)
+__device__ __forceinline__ unsigned short wlww_to_u16(unsigned short v, int window, int level)
 {
     if (window < 1) window = 1;
-    int minv = level - window / 2;
-    int maxv = level + window / 2;
-    if (maxv <= minv) maxv = minv + 1;
 
-    int iv = (int)v;
-    if (iv < minv) iv = minv;
-    if (iv > maxv) iv = maxv;
+    float minv = (float)level - (float)window * 0.5f;
+    float maxv = (float)level + (float)window * 0.5f;
+    if (maxv <= minv) maxv = minv + 1.0f;
 
-    int out = (int)((iv - minv) * 255.0f / (float)(maxv - minv));
-    if (out < 0) out = 0;
-    if (out > 255) out = 255;
-    return (unsigned char)out;
+    float fv = (float)v;
+    float u = (fv - minv) / (maxv - minv); // 0..1
+    u = fminf(1.0f, fmaxf(0.0f, u));
+
+    float out = u * 65535.0f;
+    out = fminf(65535.0f, fmaxf(0.0f, out));
+    return (unsigned short)(out + 0.5f);
 }
 
-__global__ void WLWWKernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOutBGRA,
+__global__ void WLWW16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut16,
     int w, int h, int window, int level)
 {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (x >= w || y >= h) return;
 
-    // For unnormalized coords, sample at x+0.5, y+0.5
     unsigned short v16 = tex2D<unsigned short>(texIn16, x + 0.5f, y + 0.5f);
-    unsigned char g = wlww_to_u8(v16, window, level);
+    unsigned short out16 = wlww_to_u16(v16, window, level);
 
-    uchar4 out;
-    out.x = g;   // B
-    out.y = g;   // G
-    out.z = g;   // R
-    out.w = 255; // A
-
-    surf2Dwrite(out, surfOutBGRA, x * (int)sizeof(uchar4), y);
+    surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
-__global__ void Sobel16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOutBGRA,
+__global__ void Sobel16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut16,
     int w, int h, int window, int level)
 {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -122,40 +115,30 @@ __global__ void Sobel16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t s
     int ym1 = clampi(y - 1, 0, h - 1);
     int yp1 = clampi(y + 1, 0, h - 1);
 
-    // read and WL/WW normalize to 0..255 before Sobel
-    unsigned char p00 = wlww_to_u8(tex2D<unsigned short>(texIn16, xm1 + 0.5f, ym1 + 0.5f), window, level);
-    unsigned char p10 = wlww_to_u8(tex2D<unsigned short>(texIn16, x + 0.5f, ym1 + 0.5f), window, level);
-    unsigned char p20 = wlww_to_u8(tex2D<unsigned short>(texIn16, xp1 + 0.5f, ym1 + 0.5f), window, level);
+    unsigned short p00 = wlww_to_u16(tex2D<unsigned short>(texIn16, xm1 + 0.5f, ym1 + 0.5f), window, level);
+    unsigned short p10 = wlww_to_u16(tex2D<unsigned short>(texIn16, x + 0.5f, ym1 + 0.5f), window, level);
+    unsigned short p20 = wlww_to_u16(tex2D<unsigned short>(texIn16, xp1 + 0.5f, ym1 + 0.5f), window, level);
 
-    unsigned char p01 = wlww_to_u8(tex2D<unsigned short>(texIn16, xm1 + 0.5f, y + 0.5f), window, level);
-    unsigned char p21 = wlww_to_u8(tex2D<unsigned short>(texIn16, xp1 + 0.5f, y + 0.5f), window, level);
+    unsigned short p01 = wlww_to_u16(tex2D<unsigned short>(texIn16, xm1 + 0.5f, y + 0.5f), window, level);
+    unsigned short p21 = wlww_to_u16(tex2D<unsigned short>(texIn16, xp1 + 0.5f, y + 0.5f), window, level);
 
-    unsigned char p02 = wlww_to_u8(tex2D<unsigned short>(texIn16, xm1 + 0.5f, yp1 + 0.5f), window, level);
-    unsigned char p12 = wlww_to_u8(tex2D<unsigned short>(texIn16, x + 0.5f, yp1 + 0.5f), window, level);
-    unsigned char p22 = wlww_to_u8(tex2D<unsigned short>(texIn16, xp1 + 0.5f, yp1 + 0.5f), window, level);
+    unsigned short p02 = wlww_to_u16(tex2D<unsigned short>(texIn16, xm1 + 0.5f, yp1 + 0.5f), window, level);
+    unsigned short p12 = wlww_to_u16(tex2D<unsigned short>(texIn16, x + 0.5f, yp1 + 0.5f), window, level);
+    unsigned short p22 = wlww_to_u16(tex2D<unsigned short>(texIn16, xp1 + 0.5f, yp1 + 0.5f), window, level);
 
-    int g00 = (int)p00, g10 = (int)p10, g20 = (int)p20;
-    int g01 = (int)p01, g21 = (int)p21;
-    int g02 = (int)p02, g12 = (int)p12, g22 = (int)p22;
+    int gx = -(int)p00 - 2 * (int)p01 - (int)p02 + (int)p20 + 2 * (int)p21 + (int)p22;
+    int gy = -(int)p00 - 2 * (int)p10 - (int)p20 + (int)p02 + 2 * (int)p12 + (int)p22;
 
-    int gx = (-g00 + g20) + (-2 * g01 + 2 * g21) + (-g02 + g22);
-    int gy = (-g00 - 2 * g10 - g20) + (g02 + 2 * g12 + g22);
+    float mag = sqrtf((float)(gx * gx + gy * gy));
+    mag = fminf(65535.0f, fmaxf(0.0f, mag));
 
-    int mag = abs(gx) + abs(gy);
-    if (mag > 255) mag = 255;
-
-    uchar4 out;
-    out.x = (unsigned char)mag;
-    out.y = (unsigned char)mag;
-    out.z = (unsigned char)mag;
-    out.w = 255;
-
-    surf2Dwrite(out, surfOutBGRA, x * (int)sizeof(uchar4), y);
+    unsigned short out16 = (unsigned short)(mag + 0.5f);
+    surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
 // ----------------- processing entry -----------------
 
-extern "C" int CudaProcessArrays_R16_To_BGRA(
+extern "C" int CudaProcessArrays_R16_To_R16(
     void* inArrayVoid,
     void* outArrayVoid,
     int w,
@@ -184,13 +167,13 @@ extern "C" int CudaProcessArrays_R16_To_BGRA(
     cudaError_t e = cudaCreateTextureObject(&texIn16, &resIn, &texDesc, nullptr);
     if (e != cudaSuccess) return (int)e;
 
-    // surface for output BGRA
+    // surface for output R16
     cudaResourceDesc resOut{};
     resOut.resType = cudaResourceTypeArray;
     resOut.res.array.array = outArr;
 
-    cudaSurfaceObject_t surfOut = 0;
-    e = cudaCreateSurfaceObject(&surfOut, &resOut);
+    cudaSurfaceObject_t surfOut16 = 0;
+    e = cudaCreateSurfaceObject(&surfOut16, &resOut);
     if (e != cudaSuccess) {
         cudaDestroyTextureObject(texIn16);
         return (int)e;
@@ -200,14 +183,14 @@ extern "C" int CudaProcessArrays_R16_To_BGRA(
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 
     if (enableEdge)
-        Sobel16Kernel << <grid, block >> > (texIn16, surfOut, w, h, window, level);
+        Sobel16Kernel << <grid, block >> > (texIn16, surfOut16, w, h, window, level);
     else
-        WLWWKernel << <grid, block >> > (texIn16, surfOut, w, h, window, level);
+        WLWW16Kernel << <grid, block >> > (texIn16, surfOut16, w, h, window, level);
 
     e = cudaGetLastError();
     if (e == cudaSuccess) e = cudaDeviceSynchronize();
 
-    cudaDestroySurfaceObject(surfOut);
+    cudaDestroySurfaceObject(surfOut16);
     cudaDestroyTextureObject(texIn16);
 
     return (e == cudaSuccess) ? 0 : (int)e;
