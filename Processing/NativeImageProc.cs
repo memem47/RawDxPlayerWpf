@@ -34,8 +34,13 @@ namespace RawDxPlayerWpf.Processing
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int IPC_Shutdown();
-
-        internal static IPC_Params MakeDefaultParams(int window, int level, int enableEdge)
+        public static IPC_Params MakeDefaultParams(
+            int window, int level,
+            int enableEdge,
+            int enableBlur,
+            int enableInvert,
+            int enableThreshold,
+            int thresholdValue)
         {
             return new IPC_Params
             {
@@ -44,7 +49,14 @@ namespace RawDxPlayerWpf.Processing
                 window = window,
                 level = level,
                 enableEdge = enableEdge,
-                reserved = new int[8] { 0, 0, 0, 0, 0, 0, 0, 0 }
+                reserved = new int[8]
+                {
+                    enableBlur,      // reserved[0]
+                    enableInvert,    // reserved[1]
+                    enableThreshold, // reserved[2]
+                    thresholdValue,  // reserved[3]
+                    0,0,0,0
+                }
             };
         }
     }

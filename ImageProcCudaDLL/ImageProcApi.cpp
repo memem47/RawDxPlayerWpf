@@ -128,13 +128,19 @@ extern "C" {
             p = g_params;
         }
 
-        int enablePostFilter = p.reserved[0];
+        int enableBlur = p.reserved[0];
+        int enableInvert = p.reserved[1];
+        int enableThreshold = p.reserved[2];
+        int thresholdValue = p.reserved[3];
 
         cr = CudaProcessArray_R16_Inplace(
             ioArr, g_w, g_h,
             p.window, p.level,
             p.enableEdge,
-            enablePostFilter);
+            enableBlur,
+            enableInvert,
+            enableThreshold,
+            thresholdValue);
 
         int cr2 = CudaUnmapResource(g_cudaIO);
 

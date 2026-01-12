@@ -10,13 +10,10 @@ static cudaArray_t g_midArr = nullptr;
 static int g_midW = 0;
 static int g_midH = 0;
 
-// Ensure mid array exists and matches (w,h)
 static cudaError_t EnsureMidArrayR16(int w, int h)
 {
-    if (g_midArr && g_midW == w && g_midH == h)
-        return cudaSuccess;
+    if (g_midArr && g_midW == w && g_midH == h) return cudaSuccess;
 
-    // size changed or not allocated yet
     if (g_midArr)
     {
         cudaError_t e0 = cudaFreeArray(g_midArr);
@@ -64,7 +61,7 @@ extern "C" __declspec(dllexport) int __cdecl CudaSetDeviceSafe(int gpuId)
 extern "C" __declspec(dllexport) int __cdecl CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes)
 {
     auto* t = reinterpret_cast<ID3D11Resource*>(tex2D);
-    cudaError_t e = cudaGraphicsD3D11RegisterResource(outRes, t, cudaGraphicsRegisterFlagsNone);
+    cudaError_t e = cudaGraphicsD3D11RegisterResource(outRes, t, cudaGraphicsRegisterFlagsSurfaceLoadStore);
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
@@ -192,7 +189,7 @@ __global__ void Sobel16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t s
     surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
-__global__ void BoxBlur3x3_U16(cudaTextureObject_t texMid16, cudaSurfaceObject_t surfOut16, int w, int h)
+__global__ void BoxBlur3x3_U16(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut16, int w, int h)
 {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
@@ -201,7 +198,7 @@ __global__ void BoxBlur3x3_U16(cudaTextureObject_t texMid16, cudaSurfaceObject_t
     auto sample = [&](int sx, int sy) -> unsigned int {
         sx = sx < 0 ? 0 : (sx >= w ? w - 1 : sx);
         sy = sy < 0 ? 0 : (sy >= h ? h - 1 : sy);
-        return (unsigned int)tex2D<unsigned short>(texMid16, sx + 0.5f, sy + 0.5f);
+        return (unsigned int)tex2D<unsigned short>(texIn16, sx + 0.5f, sy + 0.5f);
         };
 
     unsigned int sum = 0;
@@ -213,18 +210,41 @@ __global__ void BoxBlur3x3_U16(cudaTextureObject_t texMid16, cudaSurfaceObject_t
     surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
-__global__ void CopyU16(cudaTextureObject_t texMid16, cudaSurfaceObject_t surfOut16, int w, int h)
+__global__ void InvertU16(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut16, int w, int h)
 {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (x >= w || y >= h) return;
 
-    unsigned short v = tex2D<unsigned short>(texMid16, x + 0.5f, y + 0.5f);
+    unsigned short v = tex2D<unsigned short>(texIn16, x + 0.5f, y + 0.5f);
+    unsigned short out = (unsigned short)(65535u - (unsigned int)v);
+    surf2Dwrite(out, surfOut16, x * (int)sizeof(unsigned short), y);
+}
+
+__global__ void ThresholdU16(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut16,
+    int w, int h, unsigned short thresh)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    unsigned short v = tex2D<unsigned short>(texIn16, x + 0.5f, y + 0.5f);
+    unsigned short out = (v >= thresh) ? 65535 : 0;
+    surf2Dwrite(out, surfOut16, x * (int)sizeof(unsigned short), y);
+}
+
+__global__ void CopyU16(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut16, int w, int h)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    unsigned short v = tex2D<unsigned short>(texIn16, x + 0.5f, y + 0.5f);
     surf2Dwrite(v, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
 // ============================================================
-// In-place processing entry (IO -> MID -> IO), with cached MID
+// In-place processing entry (IO <-> MID), with cached MID
 // ============================================================
 
 extern "C" __declspec(dllexport) int __cdecl CudaProcessArray_R16_Inplace(
@@ -234,79 +254,104 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessArray_R16_Inplace(
     int window,
     int level,
     int enableEdge,
-    int enablePostFilter)
+    int enableBlur,
+    int enableInvert,
+    int enableThreshold,
+    int thresholdValue)
 {
     cudaArray_t ioArr = (cudaArray_t)ioArrayVoid;
     if (!ioArr) return (int)cudaErrorInvalidValue;
 
-    cudaError_t e;
-
-    // Ensure cached MID exists
-    e = EnsureMidArrayR16(w, h);
+    cudaError_t e = EnsureMidArrayR16(w, h);
     if (e != cudaSuccess) return (int)e;
-
-    // IO as input texture
-    cudaTextureObject_t texIO = 0;
-    e = CreateTexFromArray(ioArr, &texIO);
-    if (e != cudaSuccess) return (int)e;
-
-    // MID as output surface (stage1)
-    cudaSurfaceObject_t surfMID = 0;
-    e = CreateSurfFromArray(g_midArr, &surfMID);
-    if (e != cudaSuccess) {
-        cudaDestroyTextureObject(texIO);
-        return (int)e;
-    }
 
     dim3 block(16, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 
-    // Stage1: IO -> MID
-    if (enableEdge)
-        Sobel16Kernel << <grid, block >> > (texIO, surfMID, w, h, window, level);
-    else
-        WLWW16Kernel << <grid, block >> > (texIO, surfMID, w, h, window, level);
+    // curIsIO==true => latest result in ioArr, false => in g_midArr
+    bool curIsIO = true;
 
-    e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        cudaDestroySurfaceObject(surfMID);
-        cudaDestroyTextureObject(texIO);
-        return (int)e;
+    auto SrcArr = [&]() -> cudaArray_t { return curIsIO ? ioArr : g_midArr; };
+    auto DstArr = [&]() -> cudaArray_t { return curIsIO ? g_midArr : ioArr; };
+
+    auto RunOp = [&](auto launcher) -> cudaError_t
+        {
+            cudaTextureObject_t tex = 0;
+            cudaSurfaceObject_t surf = 0;
+
+            cudaArray_t src = SrcArr();
+            cudaArray_t dst = DstArr();
+
+            cudaError_t ee = CreateTexFromArray(src, &tex);
+            if (ee != cudaSuccess) return ee;
+
+            ee = CreateSurfFromArray(dst, &surf);
+            if (ee != cudaSuccess) { cudaDestroyTextureObject(tex); return ee; }
+
+            launcher(tex, surf);
+
+            ee = cudaGetLastError();
+
+            cudaDestroySurfaceObject(surf);
+            cudaDestroyTextureObject(tex);
+
+            if (ee != cudaSuccess) return ee;
+
+            curIsIO = !curIsIO; // swap
+            return cudaSuccess;
+        };
+
+    // Stage1: always execute (WLWW or Sobel)
+    e = RunOp([&](cudaTextureObject_t tex, cudaSurfaceObject_t surf) {
+        if (enableEdge)
+            Sobel16Kernel << <grid, block >> > (tex, surf, w, h, window, level);
+        else
+            WLWW16Kernel << <grid, block >> > (tex, surf, w, h, window, level);
+        });
+    if (e != cudaSuccess) return (int)e;
+
+    // Stage2: blur
+    if (enableBlur)
+    {
+        e = RunOp([&](cudaTextureObject_t tex, cudaSurfaceObject_t surf) {
+            BoxBlur3x3_U16 << <grid, block >> > (tex, surf, w, h);
+            });
+        if (e != cudaSuccess) return (int)e;
     }
 
-    // MID as input texture (stage2)
-    cudaTextureObject_t texMID = 0;
-    e = CreateTexFromArray(g_midArr, &texMID);
-    if (e != cudaSuccess) {
-        cudaDestroySurfaceObject(surfMID);
-        cudaDestroyTextureObject(texIO);
-        return (int)e;
+    // Stage3: invert
+    if (enableInvert)
+    {
+        e = RunOp([&](cudaTextureObject_t tex, cudaSurfaceObject_t surf) {
+            InvertU16 << <grid, block >> > (tex, surf, w, h);
+            });
+        if (e != cudaSuccess) return (int)e;
     }
 
-    // IO as output surface (stage2)
-    cudaSurfaceObject_t surfIO = 0;
-    e = CreateSurfFromArray(ioArr, &surfIO);
-    if (e != cudaSuccess) {
-        cudaDestroyTextureObject(texMID);
-        cudaDestroySurfaceObject(surfMID);
-        cudaDestroyTextureObject(texIO);
-        return (int)e;
+    // Stage4: threshold
+    if (enableThreshold)
+    {
+        int tv = thresholdValue;
+        if (tv < 0) tv = 0;
+        if (tv > 65535) tv = 65535;
+        unsigned short th = (unsigned short)tv;
+
+        e = RunOp([&](cudaTextureObject_t tex, cudaSurfaceObject_t surf) {
+            ThresholdU16 << <grid, block >> > (tex, surf, w, h, th);
+            });
+        if (e != cudaSuccess) return (int)e;
     }
 
-    // Stage2: MID -> IO
-    if (enablePostFilter)
-        BoxBlur3x3_U16 << <grid, block >> > (texMID, surfIO, w, h);
-    else
-        CopyU16 << <grid, block >> > (texMID, surfIO, w, h);
+    // Ensure final result is in IO
+    if (!curIsIO)
+    {
+        e = RunOp([&](cudaTextureObject_t tex, cudaSurfaceObject_t surf) {
+            CopyU16 << <grid, block >> > (tex, surf, w, h);
+            });
+        if (e != cudaSuccess) return (int)e;
+        // now curIsIO should be true
+    }
 
-    e = cudaGetLastError();
-    if (e == cudaSuccess) e = cudaDeviceSynchronize();
-
-    // cleanup (MID array itself is kept!)
-    cudaDestroySurfaceObject(surfIO);
-    cudaDestroyTextureObject(texMID);
-    cudaDestroySurfaceObject(surfMID);
-    cudaDestroyTextureObject(texIO);
-
+    e = cudaDeviceSynchronize();
     return (e == cudaSuccess) ? 0 : (int)e;
 }

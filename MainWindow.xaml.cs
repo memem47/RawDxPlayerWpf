@@ -28,7 +28,11 @@ namespace RawDxPlayerWpf
         // params
         private int _window = 4000;
         private int _level = 2000;
-        private int _enableEdge = 0;
+        private int _enableEdge = 0;        
+        private int _enableBlur = 0;
+        private int _enableInvert = 0;
+        private int _enableThreshold = 0;
+        private int _thresholdValue = 20000;
 
         private bool _suppressParamEvents;
         private bool _uiReady = false;
@@ -369,7 +373,13 @@ namespace RawDxPlayerWpf
 
             try
             {
-                var p = NativeImageProc.MakeDefaultParams(window: _window, level: _level, enableEdge: _enableEdge);
+                var p = NativeImageProc.MakeDefaultParams(
+                    window: _window, level: _level,
+                    enableEdge: _enableEdge,
+                    enableBlur: _enableBlur,
+                    enableInvert: _enableInvert,
+                    enableThreshold: _enableThreshold,
+                    thresholdValue: _thresholdValue);
                 _processor.SetParameters(p);
             }
             catch (Exception ex)
@@ -379,5 +389,22 @@ namespace RawDxPlayerWpf
         }
 
         private void UpdateStatus(string msg) => TbStatus.Text = msg;
+        private void CbBlur_Checked(object sender, RoutedEventArgs e) { _enableBlur = 1; ApplyParamsToDll(); }
+        private void CbBlur_Unchecked(object sender, RoutedEventArgs e) { _enableBlur = 0; ApplyParamsToDll(); }
+
+        private void CbInvert_Checked(object sender, RoutedEventArgs e) { _enableInvert = 1; ApplyParamsToDll(); }
+        private void CbInvert_Unchecked(object sender, RoutedEventArgs e) { _enableInvert = 0; ApplyParamsToDll(); }
+
+        private void CbThreshold_Checked(object sender, RoutedEventArgs e) { _enableThreshold = 1; ApplyParamsToDll(); }
+        private void CbThreshold_Unchecked(object sender, RoutedEventArgs e) { _enableThreshold = 0; ApplyParamsToDll(); }
+
+        private void TbThresh_LostFocus(object sender, RoutedEventArgs e)
+        {
+            if (!int.TryParse(TbThresh.Text, out int v)) v = _thresholdValue;
+            v = Math.Max(0, Math.Min(65535, v));
+            _thresholdValue = v;
+            TbThresh.Text = _thresholdValue.ToString();
+            ApplyParamsToDll();
+        }
     }
 }

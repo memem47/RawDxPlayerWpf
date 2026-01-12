@@ -54,7 +54,7 @@ namespace RawDxPlayerWpf.Dx
                 SampleDescription = new SampleDescription(1, 0),
 
                 Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.ShaderResource,
+                BindFlags = BindFlags.ShaderResource | BindFlags.UnorderedAccess,
                 CpuAccessFlags = CpuAccessFlags.None,
                 OptionFlags = ResourceOptionFlags.Shared
             };

@@ -57,7 +57,10 @@ extern "C" {
         int window,
         int level,
         int enableEdge,
-        int enablePostFilter);
+        int enableBlur,
+        int enableInvert,
+        int enableThreshold,
+        int thresholdValue);
 
     IPC_API int __cdecl CudaReleaseCache();
 }
