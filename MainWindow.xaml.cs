@@ -16,11 +16,6 @@ namespace RawDxPlayerWpf
     {
         private readonly DispatcherTimer _timer = new DispatcherTimer();
 
-        // Perf (wall-clock time around _processor.Execute) : last 10 frames
-        private readonly double[] _execMs = new double[10];
-        private int _execMsCount = 0;
-        private int _execMsIndex = 0;
-
         private RawSequence _seq;
         private int _index;
 
@@ -38,6 +33,7 @@ namespace RawDxPlayerWpf
         private bool _suppressParamEvents;
         private bool _uiReady = false;
 
+        // export
         private string _outputDir;
 
         public MainWindow()
@@ -52,7 +48,7 @@ namespace RawDxPlayerWpf
             SyncGuiFromParams();
             _suppressParamEvents = false;
 
-            _uiReady = true; // ★ここで初期化完了
+            _uiReady = true;
             UpdateStatus("Ready");
 
             _outputDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "output");
@@ -85,7 +81,6 @@ namespace RawDxPlayerWpf
             };
 
             if (dlg.ShowDialog() != true) return;
-
             LoadSequenceFromFile(dlg.FileName);
         }
 
@@ -96,19 +91,18 @@ namespace RawDxPlayerWpf
             _seq = RawSequence.FromAnyFileInFolder(filePath);
             _index = 0;
 
-            // renderer / writeablebitmap
             _renderer?.Dispose();
             _renderer = new DxRenderer(_seq.Width, _seq.Height, gpuId: 0);
 
             _wb = new WriteableBitmap(_seq.Width, _seq.Height, 96, 96,
-                System.Windows.Media.PixelFormats.Bgra32, null);
+                PixelFormats.Bgra32, null);
             ImgView.Source = _wb;
 
-            // init dll
+            // init dll (single IO handle)
             try
             {
                 int gpuId = 0;
-                _processor.Initialize(gpuId, _renderer.InputSharedHandle, _renderer.OutputSharedHandle);
+                _processor.Initialize(gpuId, _renderer.IoSharedHandle);
                 _dllInitialized = true;
                 ApplyParamsToDll();
             }
@@ -146,15 +140,18 @@ namespace RawDxPlayerWpf
         }
 
         /// <summary>
-        /// Render pipeline (true 16-bit):
-        /// 1) Load RAW16 -> upload to Input(R16)
-        /// 2) If DLL ON: DLL processes Input(R16) -> Output(R16)
-        ///    Else: copy Input(R16) -> Output(R16)
-        /// 3) Readback Output(R16) -> CPU WL/WW -> BGRA8 -> display
+        /// Pipeline (single IO texture, true 16-bit):
+        /// 1) Load RAW16 -> Upload to IO (R16)
+        /// 2) If DLL ON: in-place processing IO->IO using intermediate arrays in CUDA
+        /// 3) Readback IO RAW16 -> CPU WL/WW -> BGRA8 -> display
+        /// 4) Optional export (RAW16 + PNG)
         /// </summary>
         private void RenderNextFrame(bool forceSameIndex = false)
         {
             if (_seq == null || _renderer == null) return;
+
+            var swTotal = Stopwatch.StartNew();
+            long tLoadUp = 0, tCuda = 0, tRead = 0, tDisp = 0;
 
             if (!forceSameIndex)
             {
@@ -164,39 +161,116 @@ namespace RawDxPlayerWpf
 
             string path = _seq.Files[_index];
 
-            // ① RAW16をそのまま読み込んで input(R16) に upload
+            // ① RAW16 -> IO upload
+            var sw = Stopwatch.StartNew();
+            
             byte[] raw16In = RawFrameReader.Load16RawBytes(path, _seq.Width, _seq.Height);
-            _renderer.UploadInputRaw16(raw16In);
+            _renderer.UploadIoRaw16(raw16In);
+            sw.Stop();
+            tLoadUp = sw.ElapsedMilliseconds;
 
+            // ② in-place processing (optional)
             bool dllOn = (CbDllOn.IsChecked == true);
-
             if (dllOn && _dllInitialized)
             {
                 ApplyParamsToDll();
-
-                var sw = Stopwatch.StartNew();
-                _processor.Execute(); // in(R16) -> out(R16) in CUDA
+                sw.Restart();
+                _processor.Execute();
                 sw.Stop();
-
-                PushExecMs(sw.Elapsed.TotalMilliseconds);
-                UpdatePerfText();
+                tCuda = sw.ElapsedMilliseconds;
             }
-            else
+
+            // ③ IO readback -> display conversion
+            sw.Restart();
+            byte[] raw16Out = _renderer.ReadbackIoRaw16();
+            sw.Stop();
+            tRead = sw.ElapsedMilliseconds;
+    
+            // ---- Display WL/WW ----
+            // Edge出力は輝度分布が変わるので、表示用WL/WWは自動推定する
+            int dispWindow = _window;
+            int dispLevel  = _level;
+            if (_enableEdge != 0)
             {
-                // DLL OFF: input(R16) -> output(R16) passthrough
-                _renderer.CopyInputToOutput();
-                // perf not updated
+                GetAutoWindowLevelFromRaw16(raw16Out, out dispWindow, out dispLevel);
             }
-
-            // ③ 出力(raw16)を readback して、CPUでWL/WWし表示
-            byte[] raw16Out = _renderer.ReadbackOutputRaw16();
-            byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16Out, _seq.Width, _seq.Height, _window, _level);
-
+    
+            sw.Restart();
+            byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16Out, _seq.Width, _seq.Height, dispWindow, dispLevel);
             _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgra, _seq.Width * 4, 0);
+            sw.Stop();
+            tDisp = sw.ElapsedMilliseconds;
 
-            TbStatus.Text = $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}";
+            swTotal.Stop();
+            TbStatus.Text =
+            $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}" +
+            $" | Load+Up {tLoadUp}ms | CUDA {tCuda}ms | Read {tRead}ms | Disp {tDisp}ms | Total {swTotal.ElapsedMilliseconds}ms";
 
+            // ④ export
             SaveFrameIfEnabled(raw16Out, bgra, _seq.Width, _seq.Height, _index);
+        }
+
+        // Edge表示用：RAW16のmin/maxからwindow/levelを推定
+        private static void GetAutoWindowLevelFromRaw16(byte[] raw16LittleEndian, out int window, out int level)
+        {
+            int pixels = raw16LittleEndian.Length / 2;
+            if (pixels <= 0)
+            {
+                window = 65535;
+                level = 32768;
+                return;
+            }
+    
+            int min = 65535;
+            int max = 0;
+    
+            for (int i = 0; i < pixels; i++)
+            {
+                int lo = raw16LittleEndian[i * 2 + 0];
+                int hi = raw16LittleEndian[i * 2 + 1];
+                int v = (hi << 8) | lo;
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+    
+            int w = max - min;
+            if (w < 1) w = 1;
+            int l = min + w / 2;
+    
+            window = Math.Max(1, Math.Min(65535, w));
+            level  = Math.Max(0, Math.Min(65535, l));
+        }
+
+        private void SaveFrameIfEnabled(byte[] raw16Out, byte[] bgraForPng, int width, int height, int frameIndex)
+        {
+            if (CbSaveOn?.IsChecked != true) return;
+            if (raw16Out == null || raw16Out.Length < width * height * 2) return;
+            if (bgraForPng == null || bgraForPng.Length < width * height * 4) return;
+
+            try
+            {
+                Directory.CreateDirectory(_outputDir);
+
+                string stem = $"frame_{frameIndex:D6}";
+                string rawPath = Path.Combine(_outputDir, stem + "_proc16.raw");
+                string pngPath = Path.Combine(_outputDir, stem + "_view.png");
+
+                File.WriteAllBytes(rawPath, raw16Out);
+                SaveBgraToPng(bgraForPng, width, height, pngPath);
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Save failed: {ex.Message}");
+            }
+        }
+
+        private static void SaveBgraToPng(byte[] bgra, int width, int height, string outPath)
+        {
+            var bs = BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null, bgra, width * 4);
+            var enc = new PngBitmapEncoder();
+            enc.Frames.Add(BitmapFrame.Create(bs));
+            using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                enc.Save(fs);
         }
 
         // ---- GUI events: Params ----
@@ -208,7 +282,6 @@ namespace RawDxPlayerWpf
             _enableEdge = 0;
             SyncGuiFromParams();
             ApplyParamsToDll();
-
             if (_seq != null) RenderNextFrame(forceSameIndex: true);
         }
 
@@ -235,12 +308,9 @@ namespace RawDxPlayerWpf
             ApplyParamsToDll();
         }
 
-        // Slider -> TextBox
         private void SlWindow_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (!_uiReady) return;
-            if (_suppressParamEvents) return;
-
+            if (!_uiReady || _suppressParamEvents) return;
             _window = (int)Math.Round(SlWindow.Value);
             if (TbWindow != null) TbWindow.Text = _window.ToString();
             ApplyParamsToDll();
@@ -248,15 +318,12 @@ namespace RawDxPlayerWpf
 
         private void SlLevel_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
         {
-            if (!_uiReady) return;
-            if (_suppressParamEvents) return;
-
+            if (!_uiReady || _suppressParamEvents) return;
             _level = (int)Math.Round(SlLevel.Value);
             if (TbLevel != null) TbLevel.Text = _level.ToString();
             ApplyParamsToDll();
         }
 
-        // TextBox -> Slider（入力確定）
         private void TbWindow_LostFocus(object sender, RoutedEventArgs e)
         {
             if (!int.TryParse(TbWindow.Text, out int v)) v = _window;
@@ -312,81 +379,5 @@ namespace RawDxPlayerWpf
         }
 
         private void UpdateStatus(string msg) => TbStatus.Text = msg;
-
-        private void PushExecMs(double ms)
-        {
-            _execMs[_execMsIndex] = ms;
-            _execMsIndex = (_execMsIndex + 1) % _execMs.Length;
-            _execMsCount = Math.Min(_execMsCount + 1, _execMs.Length);
-        }
-
-        private double GetAvgExecMs()
-        {
-            if (_execMsCount == 0) return 0;
-            double sum = 0;
-            for (int i = 0; i < _execMsCount; i++) sum += _execMs[i];
-            return sum / _execMsCount;
-        }
-
-        private void UpdatePerfText()
-        {
-            double avg = GetAvgExecMs();
-            if (avg <= 0)
-            {
-                TbCudaMs.Text = "CUDA avg(10): -";
-                return;
-            }
-            double fps = 1000.0 / avg;
-            TbCudaMs.Text = $"CUDA avg(10): {avg:F2} ms  ({fps:F1} fps)";
-        }
-
-
-        // ---- Save (true 16-bit RAW + display PNG) ----
-
-        private void SaveFrameIfEnabled(byte[] raw16Out, byte[] bgraForPng, int width, int height, int frameIndex)
-        {
-            if (CbSaveOn?.IsChecked != true) return;
-            if (raw16Out == null || raw16Out.Length < width * height * 2) return;
-            if (bgraForPng == null || bgraForPng.Length < width * height * 4) return;
-
-            try
-            {
-                Directory.CreateDirectory(_outputDir);
-
-                // 同名上書きになるのが嫌なら、日時や元ファイル名も混ぜてください
-                string stem = $"frame_{frameIndex:D6}";
-                string rawPath = Path.Combine(_outputDir, stem + "_proc16.raw");
-                string pngPath = Path.Combine(_outputDir, stem + "_view.png");
-
-                // RAW：真の16bit（R16出力をそのまま）
-                File.WriteAllBytes(rawPath, raw16Out);
-
-                // PNG：表示用（WL/WW後のBGRA8）
-                SaveBgraToPng(bgraForPng, width, height, pngPath);
-            }
-            catch (Exception ex)
-            {
-                // 毎フレームMessageBoxは危険なので、ステータスだけ
-                UpdateStatus($"Save failed: {ex.Message}");
-            }
-        }
-
-        private static void SaveBgraToPng(byte[] bgra, int width, int height, string outPath)
-        {
-            var bs = BitmapSource.Create(
-                width, height,
-                96, 96,
-                PixelFormats.Bgra32,
-                null,
-                bgra,
-                width * 4);
-
-            var enc = new PngBitmapEncoder();
-            enc.Frames.Add(BitmapFrame.Create(bs));
-            using (var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                enc.Save(fs);
-            }
-        }
     }
 }

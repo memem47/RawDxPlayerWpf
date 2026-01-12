@@ -24,7 +24,7 @@ namespace RawDxPlayerWpf.Processing
         }
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int IPC_Init(int gpuId, IntPtr inSharedHandle, IntPtr outSharedHandle);
+        internal static extern int IPC_Init(int gpuId, IntPtr ioSharedHandle);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int IPC_SetParams(ref IPC_Params p);
@@ -44,7 +44,7 @@ namespace RawDxPlayerWpf.Processing
                 window = window,
                 level = level,
                 enableEdge = enableEdge,
-                reserved = new int[8]
+                reserved = new int[8] { 0, 0, 0, 0, 0, 0, 0, 0 }
             };
         }
     }

@@ -2,80 +2,131 @@
 #include <cuda_runtime.h>
 #include <cuda_d3d11_interop.h>
 
-// ------------------------------------------------------------
-// Basic interop helpers
-// ------------------------------------------------------------
+// ============================================================
+// Cached intermediate array (MID) : reuse across frames
+// ============================================================
 
-extern "C" int CudaSetDeviceSafe(int gpuId)
+static cudaArray_t g_midArr = nullptr;
+static int g_midW = 0;
+static int g_midH = 0;
+
+// Ensure mid array exists and matches (w,h)
+static cudaError_t EnsureMidArrayR16(int w, int h)
+{
+    if (g_midArr && g_midW == w && g_midH == h)
+        return cudaSuccess;
+
+    // size changed or not allocated yet
+    if (g_midArr)
+    {
+        cudaError_t e0 = cudaFreeArray(g_midArr);
+        g_midArr = nullptr;
+        g_midW = g_midH = 0;
+        if (e0 != cudaSuccess) return e0;
+    }
+
+    cudaChannelFormatDesc ch = cudaCreateChannelDesc<unsigned short>();
+    cudaError_t e = cudaMallocArray(&g_midArr, &ch, (size_t)w, (size_t)h, cudaArraySurfaceLoadStore);
+    if (e != cudaSuccess)
+    {
+        g_midArr = nullptr;
+        g_midW = g_midH = 0;
+        return e;
+    }
+
+    g_midW = w;
+    g_midH = h;
+    return cudaSuccess;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CudaReleaseCache()
+{
+    if (g_midArr)
+    {
+        cudaError_t e = cudaFreeArray(g_midArr);
+        g_midArr = nullptr;
+        g_midW = g_midH = 0;
+        return (e == cudaSuccess) ? 0 : (int)e;
+    }
+    return 0;
+}
+
+// ============================================================
+// Basic interop helpers
+// ============================================================
+
+extern "C" __declspec(dllexport) int __cdecl CudaSetDeviceSafe(int gpuId)
 {
     cudaError_t e = cudaSetDevice(gpuId);
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
-extern "C" int CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes)
+extern "C" __declspec(dllexport) int __cdecl CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes)
 {
     auto* t = reinterpret_cast<ID3D11Resource*>(tex2D);
     cudaError_t e = cudaGraphicsD3D11RegisterResource(outRes, t, cudaGraphicsRegisterFlagsNone);
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
-extern "C" int CudaUnregister(cudaGraphicsResource* res)
+extern "C" __declspec(dllexport) int __cdecl CudaUnregister(cudaGraphicsResource* res)
 {
     if (!res) return 0;
     cudaError_t e = cudaGraphicsUnregisterResource(res);
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
-// Map and get arrays (keep mapped!)
-extern "C" int CudaMapGetArraysMapped(
-    cudaGraphicsResource* inRes,
-    cudaGraphicsResource* outRes,
-    void** inArray,
-    void** outArray)
+extern "C" __declspec(dllexport) int __cdecl CudaMapGetArrayMapped(cudaGraphicsResource* ioRes, void** ioArray)
 {
-    if (!inRes || !outRes || !inArray || !outArray) return (int)cudaErrorInvalidValue;
+    if (!ioRes || !ioArray) return (int)cudaErrorInvalidValue;
 
-    cudaError_t e;
-
-    e = cudaGraphicsMapResources(1, &inRes, 0);
+    cudaError_t e = cudaGraphicsMapResources(1, &ioRes, 0);
     if (e != cudaSuccess) return (int)e;
 
-    e = cudaGraphicsMapResources(1, &outRes, 0);
-    if (e != cudaSuccess) {
-        cudaGraphicsUnmapResources(1, &inRes, 0);
-        return (int)e;
-    }
-
-    cudaArray_t inArr = nullptr;
-    cudaArray_t outArr = nullptr;
-
-    e = cudaGraphicsSubResourceGetMappedArray(&inArr, inRes, 0, 0);
+    cudaArray_t arr = nullptr;
+    e = cudaGraphicsSubResourceGetMappedArray(&arr, ioRes, 0, 0);
     if (e != cudaSuccess) return (int)e;
 
-    e = cudaGraphicsSubResourceGetMappedArray(&outArr, outRes, 0, 0);
-    if (e != cudaSuccess) return (int)e;
-
-    *inArray = (void*)inArr;
-    *outArray = (void*)outArr;
+    *ioArray = (void*)arr;
     return 0;
 }
 
-extern "C" int CudaUnmapResources(cudaGraphicsResource* inRes, cudaGraphicsResource* outRes)
+extern "C" __declspec(dllexport) int __cdecl CudaUnmapResource(cudaGraphicsResource* ioRes)
 {
-    cudaError_t e;
-
-    e = cudaGraphicsUnmapResources(1, &outRes, 0);
-    if (e != cudaSuccess) return (int)e;
-
-    e = cudaGraphicsUnmapResources(1, &inRes, 0);
-    if (e != cudaSuccess) return (int)e;
-
-    return 0;
+    cudaError_t e = cudaGraphicsUnmapResources(1, &ioRes, 0);
+    return (e == cudaSuccess) ? 0 : (int)e;
 }
 
-// ------------------------------------------------------------
-// Kernels (stage 1)
-// ------------------------------------------------------------
+// ============================================================
+// Utility: create texture/surface from array
+// ============================================================
+
+static cudaError_t CreateTexFromArray(cudaArray_t arr, cudaTextureObject_t* outTex)
+{
+    cudaResourceDesc res{};
+    res.resType = cudaResourceTypeArray;
+    res.res.array.array = arr;
+
+    cudaTextureDesc tex{};
+    tex.addressMode[0] = cudaAddressModeClamp;
+    tex.addressMode[1] = cudaAddressModeClamp;
+    tex.filterMode = cudaFilterModePoint;
+    tex.readMode = cudaReadModeElementType;
+    tex.normalizedCoords = 0;
+
+    return cudaCreateTextureObject(outTex, &res, &tex, nullptr);
+}
+
+static cudaError_t CreateSurfFromArray(cudaArray_t arr, cudaSurfaceObject_t* outSurf)
+{
+    cudaResourceDesc res{};
+    res.resType = cudaResourceTypeArray;
+    res.res.array.array = arr;
+    return cudaCreateSurfaceObject(outSurf, &res);
+}
+
+// ============================================================
+// Kernels
+// ============================================================
 
 __device__ __forceinline__ unsigned short wlww_to_u16(unsigned short v, int window, int level)
 {
@@ -86,7 +137,7 @@ __device__ __forceinline__ unsigned short wlww_to_u16(unsigned short v, int wind
     if (maxv <= minv) maxv = minv + 1.0f;
 
     float fv = (float)v;
-    float u = (fv - minv) / (maxv - minv); // 0..1
+    float u = (fv - minv) / (maxv - minv);
     u = fminf(1.0f, fmaxf(0.0f, u));
 
     float out = u * 65535.0f;
@@ -103,7 +154,6 @@ __global__ void WLWW16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t su
 
     unsigned short v16 = tex2D<unsigned short>(texIn16, x + 0.5f, y + 0.5f);
     unsigned short out16 = wlww_to_u16(v16, window, level);
-
     surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
@@ -142,17 +192,12 @@ __global__ void Sobel16Kernel(cudaTextureObject_t texIn16, cudaSurfaceObject_t s
     surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
-// ------------------------------------------------------------
-// Kernel (stage 2) - Demo post filter: 3x3 box blur
-// ------------------------------------------------------------
-
 __global__ void BoxBlur3x3_U16(cudaTextureObject_t texMid16, cudaSurfaceObject_t surfOut16, int w, int h)
 {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
     if (x >= w || y >= h) return;
 
-    // clamp sampling
     auto sample = [&](int sx, int sy) -> unsigned int {
         sx = sx < 0 ? 0 : (sx >= w ? w - 1 : sx);
         sy = sy < 0 ? 0 : (sy >= h ? h - 1 : sy);
@@ -164,11 +209,10 @@ __global__ void BoxBlur3x3_U16(cudaTextureObject_t texMid16, cudaSurfaceObject_t
     sum += sample(x - 1, y);     sum += sample(x, y);     sum += sample(x + 1, y);
     sum += sample(x - 1, y + 1); sum += sample(x, y + 1); sum += sample(x + 1, y + 1);
 
-    unsigned short out16 = (unsigned short)((sum + 4) / 9); // round
+    unsigned short out16 = (unsigned short)((sum + 4) / 9);
     surf2Dwrite(out16, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
-// If post filter disabled, just copy mid -> out (2nd stage still keeps pipeline consistent)
 __global__ void CopyU16(cudaTextureObject_t texMid16, cudaSurfaceObject_t surfOut16, int w, int h)
 {
     int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
@@ -179,37 +223,12 @@ __global__ void CopyU16(cudaTextureObject_t texMid16, cudaSurfaceObject_t surfOu
     surf2Dwrite(v, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
-// ------------------------------------------------------------
-// Processing entry: in(R16) -> [stage1] -> mid(R16) -> [stage2] -> out(R16)
-// ------------------------------------------------------------
+// ============================================================
+// In-place processing entry (IO -> MID -> IO), with cached MID
+// ============================================================
 
-static cudaError_t CreateTexFromArray(cudaArray_t arr, cudaTextureObject_t* outTex)
-{
-    cudaResourceDesc res{};
-    res.resType = cudaResourceTypeArray;
-    res.res.array.array = arr;
-
-    cudaTextureDesc tex{};
-    tex.addressMode[0] = cudaAddressModeClamp;
-    tex.addressMode[1] = cudaAddressModeClamp;
-    tex.filterMode = cudaFilterModePoint;
-    tex.readMode = cudaReadModeElementType;
-    tex.normalizedCoords = 0;
-
-    return cudaCreateTextureObject(outTex, &res, &tex, nullptr);
-}
-
-static cudaError_t CreateSurfFromArray(cudaArray_t arr, cudaSurfaceObject_t* outSurf)
-{
-    cudaResourceDesc res{};
-    res.resType = cudaResourceTypeArray;
-    res.res.array.array = arr;
-    return cudaCreateSurfaceObject(outSurf, &res);
-}
-
-extern "C" int CudaProcessArrays_R16_To_R16(
-    void* inArrayVoid,
-    void* outArrayVoid,
+extern "C" __declspec(dllexport) int __cdecl CudaProcessArray_R16_Inplace(
+    void* ioArrayVoid,
     int w,
     int h,
     int window,
@@ -217,90 +236,77 @@ extern "C" int CudaProcessArrays_R16_To_R16(
     int enableEdge,
     int enablePostFilter)
 {
-    auto inArr = (cudaArray_t)inArrayVoid;
-    auto outArr = (cudaArray_t)outArrayVoid;
-    if (!inArr || !outArr) return (int)cudaErrorInvalidValue;
+    cudaArray_t ioArr = (cudaArray_t)ioArrayVoid;
+    if (!ioArr) return (int)cudaErrorInvalidValue;
 
     cudaError_t e;
 
-    // --- Create input texture (from inArr) ---
-    cudaTextureObject_t texIn16 = 0;
-    e = CreateTexFromArray(inArr, &texIn16);
+    // Ensure cached MID exists
+    e = EnsureMidArrayR16(w, h);
     if (e != cudaSuccess) return (int)e;
 
-    // --- Allocate intermediate array (R16 + surface load/store) ---
-    cudaChannelFormatDesc ch = cudaCreateChannelDesc<unsigned short>();
-    cudaArray_t midArr = nullptr;
-    e = cudaMallocArray(&midArr, &ch, (size_t)w, (size_t)h, cudaArraySurfaceLoadStore);
-    if (e != cudaSuccess) {
-        cudaDestroyTextureObject(texIn16);
-        return (int)e;
-    }
+    // IO as input texture
+    cudaTextureObject_t texIO = 0;
+    e = CreateTexFromArray(ioArr, &texIO);
+    if (e != cudaSuccess) return (int)e;
 
-    // --- Stage1 output surface: mid ---
-    cudaSurfaceObject_t surfMid16 = 0;
-    e = CreateSurfFromArray(midArr, &surfMid16);
+    // MID as output surface (stage1)
+    cudaSurfaceObject_t surfMID = 0;
+    e = CreateSurfFromArray(g_midArr, &surfMID);
     if (e != cudaSuccess) {
-        cudaFreeArray(midArr);
-        cudaDestroyTextureObject(texIn16);
+        cudaDestroyTextureObject(texIO);
         return (int)e;
     }
 
     dim3 block(16, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 
-    // Stage1: input -> mid
+    // Stage1: IO -> MID
     if (enableEdge)
-        Sobel16Kernel << <grid, block >> > (texIn16, surfMid16, w, h, window, level);
+        Sobel16Kernel << <grid, block >> > (texIO, surfMID, w, h, window, level);
     else
-        WLWW16Kernel << <grid, block >> > (texIn16, surfMid16, w, h, window, level);
+        WLWW16Kernel << <grid, block >> > (texIO, surfMID, w, h, window, level);
 
     e = cudaGetLastError();
     if (e != cudaSuccess) {
-        cudaDestroySurfaceObject(surfMid16);
-        cudaFreeArray(midArr);
-        cudaDestroyTextureObject(texIn16);
+        cudaDestroySurfaceObject(surfMID);
+        cudaDestroyTextureObject(texIO);
         return (int)e;
     }
 
-    // --- Create mid texture (read stage2) ---
-    cudaTextureObject_t texMid16 = 0;
-    e = CreateTexFromArray(midArr, &texMid16);
+    // MID as input texture (stage2)
+    cudaTextureObject_t texMID = 0;
+    e = CreateTexFromArray(g_midArr, &texMID);
     if (e != cudaSuccess) {
-        cudaDestroySurfaceObject(surfMid16);
-        cudaFreeArray(midArr);
-        cudaDestroyTextureObject(texIn16);
+        cudaDestroySurfaceObject(surfMID);
+        cudaDestroyTextureObject(texIO);
         return (int)e;
     }
 
-    // --- Create output surface (from outArr) ---
-    cudaSurfaceObject_t surfOut16 = 0;
-    e = CreateSurfFromArray(outArr, &surfOut16);
+    // IO as output surface (stage2)
+    cudaSurfaceObject_t surfIO = 0;
+    e = CreateSurfFromArray(ioArr, &surfIO);
     if (e != cudaSuccess) {
-        cudaDestroyTextureObject(texMid16);
-        cudaDestroySurfaceObject(surfMid16);
-        cudaFreeArray(midArr);
-        cudaDestroyTextureObject(texIn16);
+        cudaDestroyTextureObject(texMID);
+        cudaDestroySurfaceObject(surfMID);
+        cudaDestroyTextureObject(texIO);
         return (int)e;
     }
 
-    // Stage2: mid -> out (post filter)
+    // Stage2: MID -> IO
     if (enablePostFilter)
-        BoxBlur3x3_U16 << <grid, block >> > (texMid16, surfOut16, w, h);
+        BoxBlur3x3_U16 << <grid, block >> > (texMID, surfIO, w, h);
     else
-        CopyU16 << <grid, block >> > (texMid16, surfOut16, w, h);
+        CopyU16 << <grid, block >> > (texMID, surfIO, w, h);
 
     e = cudaGetLastError();
     if (e == cudaSuccess) e = cudaDeviceSynchronize();
 
-    // cleanup
-    cudaDestroySurfaceObject(surfOut16);
-    cudaDestroyTextureObject(texMid16);
-
-    cudaDestroySurfaceObject(surfMid16);
-    cudaFreeArray(midArr);
-
-    cudaDestroyTextureObject(texIn16);
+    // cleanup (MID array itself is kept!)
+    cudaDestroySurfaceObject(surfIO);
+    cudaDestroyTextureObject(texMID);
+    cudaDestroySurfaceObject(surfMID);
+    cudaDestroyTextureObject(texIO);
 
     return (e == cudaSuccess) ? 0 : (int)e;
 }

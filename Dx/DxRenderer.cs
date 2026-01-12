@@ -8,11 +8,9 @@ using Device = SharpDX.Direct3D11.Device;
 namespace RawDxPlayerWpf.Dx
 {
     /// <summary>
-    /// Shared textures:
-    /// - Input:  R16_UINT  (RAW16 upload)
-    /// - Output: R16_UINT  (processed result in true 16-bit)
-    ///
-    /// Display is done by CPU converting output RAW16 -> BGRA8 (WL/WW).
+    /// Shared texture (single IO):
+    /// - IO: R16_UINT (upload RAW16, process in-place, readback RAW16)
+    /// Display is done by CPU converting RAW16 -> BGRA8 (WL/WW).
     /// </summary>
     public sealed class DxRenderer : IDisposable
     {
@@ -22,19 +20,14 @@ namespace RawDxPlayerWpf.Dx
         private readonly int _width;
         private readonly int _height;
 
-        // Shared textures (DX11)
-        private readonly Texture2D _inputSharedTex;   // R16_UINT
-        private readonly Texture2D _outputSharedTex;  // R16_UINT
-        private readonly IntPtr _inputSharedHandle;
-        private readonly IntPtr _outputSharedHandle;
+        private readonly Texture2D _ioSharedTex;     // R16_UINT
+        private readonly IntPtr _ioSharedHandle;
 
-        // Staging (CPU upload)
-        private readonly Texture2D _stagingUploadRaw16;    // R16 staging (CPU->GPU)
-        // Staging (CPU readback)
-        private readonly Texture2D _stagingReadbackRaw16;  // R16 staging (GPU->CPU)
+        // Staging upload/readback (CPU)
+        private readonly Texture2D _stagingUploadRaw16;
+        private readonly Texture2D _stagingReadbackRaw16;
 
-        public IntPtr InputSharedHandle => _inputSharedHandle;
-        public IntPtr OutputSharedHandle => _outputSharedHandle;
+        public IntPtr IoSharedHandle => _ioSharedHandle;
 
         public DxRenderer(int width, int height, int gpuId = 0)
         {
@@ -50,8 +43,8 @@ namespace RawDxPlayerWpf.Dx
             adapter.Dispose();
             factory.Dispose();
 
-            // ---- Shared Input (R16_UINT) ----
-            var inDesc = new Texture2DDescription
+            // ---- Shared IO (R16_UINT) ----
+            var ioDesc = new Texture2DDescription
             {
                 Width = width,
                 Height = height,
@@ -65,28 +58,9 @@ namespace RawDxPlayerWpf.Dx
                 CpuAccessFlags = CpuAccessFlags.None,
                 OptionFlags = ResourceOptionFlags.Shared
             };
-            _inputSharedTex = new Texture2D(_device, inDesc);
-            using (var r = _inputSharedTex.QueryInterface<SharpDX.DXGI.Resource>())
-                _inputSharedHandle = r.SharedHandle;
-
-            // ---- Shared Output (R16_UINT) ----
-            var outDesc = new Texture2DDescription
-            {
-                Width = width,
-                Height = height,
-                ArraySize = 1,
-                MipLevels = 1,
-                Format = Format.R16_UInt,
-                SampleDescription = new SampleDescription(1, 0),
-
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.ShaderResource,
-                CpuAccessFlags = CpuAccessFlags.None,
-                OptionFlags = ResourceOptionFlags.Shared
-            };
-            _outputSharedTex = new Texture2D(_device, outDesc);
-            using (var r = _outputSharedTex.QueryInterface<SharpDX.DXGI.Resource>())
-                _outputSharedHandle = r.SharedHandle;
+            _ioSharedTex = new Texture2D(_device, ioDesc);
+            using (var r = _ioSharedTex.QueryInterface<SharpDX.DXGI.Resource>())
+                _ioSharedHandle = r.SharedHandle;
 
             // ---- Staging upload for RAW16 ----
             _stagingUploadRaw16 = new Texture2D(_device, new Texture2DDescription
@@ -120,10 +94,9 @@ namespace RawDxPlayerWpf.Dx
         }
 
         /// <summary>
-        /// Upload RAW16 (little endian) to shared input (R16_UINT).
-        /// raw16 length must be >= width*height*2.
+        /// Upload RAW16 (little endian) into shared IO texture.
         /// </summary>
-        public void UploadInputRaw16(byte[] raw16LittleEndian)
+        public void UploadIoRaw16(byte[] raw16LittleEndian)
         {
             if (raw16LittleEndian == null) throw new ArgumentNullException(nameof(raw16LittleEndian));
             int bytesNeeded = checked(_width * _height * 2);
@@ -148,26 +121,17 @@ namespace RawDxPlayerWpf.Dx
                 _ctx.UnmapSubresource(_stagingUploadRaw16, 0);
             }
 
-            _ctx.CopyResource(_stagingUploadRaw16, _inputSharedTex);
+            _ctx.CopyResource(_stagingUploadRaw16, _ioSharedTex);
         }
 
         /// <summary>
-        /// For DLL OFF path: copy input(shared) -> output(shared) on GPU.
-        /// This preserves true 16-bit output (no pseudo conversion).
-        /// </summary>
-        public void CopyInputToOutput()
-        {
-            _ctx.CopyResource(_inputSharedTex, _outputSharedTex);
-        }
-
-        /// <summary>
-        /// Readback shared output (R16_UINT) to CPU (little endian bytes).
+        /// Read back shared IO texture (R16_UINT) to CPU bytes.
         /// Returns exactly width*height*2 bytes.
         /// </summary>
-        public byte[] ReadbackOutputRaw16()
+        public byte[] ReadbackIoRaw16()
         {
             _ctx.Flush();
-            _ctx.CopyResource(_outputSharedTex, _stagingReadbackRaw16);
+            _ctx.CopyResource(_ioSharedTex, _stagingReadbackRaw16);
 
             var box = _ctx.MapSubresource(_stagingReadbackRaw16, 0, MapMode.Read, SharpDX.Direct3D11.MapFlags.None);
             try
@@ -196,10 +160,7 @@ namespace RawDxPlayerWpf.Dx
         {
             _stagingReadbackRaw16?.Dispose();
             _stagingUploadRaw16?.Dispose();
-
-            _outputSharedTex?.Dispose();
-            _inputSharedTex?.Dispose();
-
+            _ioSharedTex?.Dispose();
             _ctx?.Dispose();
             _device?.Dispose();
         }
