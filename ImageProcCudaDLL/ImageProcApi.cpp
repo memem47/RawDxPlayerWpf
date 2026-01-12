@@ -10,10 +10,6 @@
 
 using Microsoft::WRL::ComPtr;
 
-// CUDA headers only in implementation
-#include <cuda_runtime.h>
-#include <cuda_d3d11_interop.h>
-
 static cudaGraphicsResource* g_cudaIn = nullptr;
 static cudaGraphicsResource* g_cudaOut = nullptr;
 
@@ -49,27 +45,18 @@ static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11D
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 
-    static const D3D_FEATURE_LEVEL levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0
-    };
-    D3D_FEATURE_LEVEL outLevel = D3D_FEATURE_LEVEL_11_0;
-
-    hr = D3D11CreateDevice(
+    D3D_FEATURE_LEVEL fl;
+    return D3D11CreateDevice(
         adapter.Get(),
         D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
         flags,
-        levels,
-        (UINT)_countof(levels),
+        nullptr, 0,
         D3D11_SDK_VERSION,
         dev,
-        &outLevel,
-        ctx);
-
-    return hr;
+        &fl,
+        ctx
+    );
 }
 
 extern "C" {
@@ -104,10 +91,11 @@ extern "C" {
         g_w = (int)inDesc.Width;
         g_h = (int)inDesc.Height;
 
-        // CUDA device
+        // CUDA device select
         int cr = CudaSetDeviceSafe((int)gpuId);
         if (cr != 0) return -1000 - cr;
 
+        // Register D3D11 textures to CUDA
         cr = CudaRegisterD3D11Texture(g_inputTex.Get(), &g_cudaIn);
         if (cr != 0) return -1100 - cr;
 
@@ -121,7 +109,14 @@ extern "C" {
         p.window = 4000;
         p.level = 2000;
         p.enableEdge = 0;
-        g_params = p;
+
+        // reserved[0] = enablePostFilter (default ON so you can see it without changing C# immediately)
+        p.reserved[0] = 1;
+
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            g_params = p;
+        }
 
         g_initialized.store(true);
         return IPC_OK;
@@ -141,25 +136,37 @@ extern "C" {
     int32_t __cdecl IPC_Execute()
     {
         if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+        if (!g_cudaIn || !g_cudaOut) return IPC_ERR_NOT_INITIALIZED;
 
+        void* inArr = nullptr;
+        void* outArr = nullptr;
+
+        // Map and get arrays (keep mapped until after kernel)
+        int cr = CudaMapGetArraysMapped(g_cudaIn, g_cudaOut, &inArr, &outArr);
+        if (cr != 0) return -1300 - cr;
+
+        // Copy params locally (avoid race)
         IPC_Params p;
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             p = g_params;
         }
 
-        void* inArr = nullptr;
-        void* outArr = nullptr;
+        int enablePostFilter = p.reserved[0]; // 0/1
 
-        int cr = CudaMapGetArraysMapped(g_cudaIn, g_cudaOut, &inArr, &outArr);
-        if (cr != 0) return -2000 - cr;
+        // Run kernel(s): in(R16) -> out(R16) with optional second stage
+        cr = CudaProcessArrays_R16_To_R16(
+            inArr, outArr, g_w, g_h,
+            p.window, p.level,
+            p.enableEdge,
+            enablePostFilter);
 
-        cr = CudaProcessArrays_R16_To_R16(inArr, outArr, g_w, g_h, p.window, p.level, p.enableEdge);
+        // Unmap resources 반드시実行
+        int cr2 = CudaUnmapResources(g_cudaIn, g_cudaOut);
 
-        int ur = CudaUnmapResources(g_cudaIn, g_cudaOut);
-        if (ur != 0) return -2100 - ur;
+        if (cr != 0) return -1400 - cr;
+        if (cr2 != 0) return -1500 - cr2;
 
-        if (cr != 0) return -2200 - cr;
         return IPC_OK;
     }
 

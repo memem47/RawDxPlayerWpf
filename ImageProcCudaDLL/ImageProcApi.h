@@ -26,59 +26,58 @@ extern "C" {
         uint32_t sizeBytes;   // sizeof(IPC_Params)
         uint32_t version;     // 1
 
-        // Window/Level (16-bit domain)
+        // WL/WW (16-bit domain)
         int32_t window;       // 1..65535
         int32_t level;        // 0..65535
 
-        // 0: WL/WW only, 1: edge output (simple Sobel)
-        int32_t enableEdge;
+        // flags
+        int32_t enableEdge;   // 0: WL/WW, 1: edge(sobel)
 
-        int32_t reserved0;
-        int32_t reserved1;
-        int32_t reserved2;
-        int32_t reserved3;
+        // reserved:
+        // reserved[0] is used as enablePostFilter (0/1) in this implementation
+        int32_t reserved[8];
     };
 #pragma pack(pop)
 
-    // ---- Public DLL API (called from C#) ----
-
-    // Initialize interop.
-    // inSharedHandle/outSharedHandle must be handles to D3D11 shared textures:
-    //   input  = DXGI_FORMAT_R16_UINT
-    //   output = DXGI_FORMAT_R16_UINT
+    // Init: gpuId + shared handles (both must be D3D11 shared Texture2D with DXGI_FORMAT_R16_UINT)
     IPC_API int32_t __cdecl IPC_Init(int32_t gpuId, void* inSharedHandle, void* outSharedHandle);
 
+    // Params
     IPC_API int32_t __cdecl IPC_SetParams(const IPC_Params* p);
 
-    // Execute processing: Input(R16_UINT) -> Output(R16_UINT)
+    // Execute: Input(R16_UINT) -> Output(R16_UINT)
     IPC_API int32_t __cdecl IPC_Execute();
 
+    // Shutdown
     IPC_API int32_t __cdecl IPC_Shutdown();
 
-    // ---- CUDA helpers (implemented in CudaInterop.cu) ----
-    IPC_API int CudaSetDeviceSafe(int gpuId);
-    IPC_API int CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes);
-    IPC_API int CudaUnregister(cudaGraphicsResource* res);
 
-    // Map and get arrays (keeps mapped until CudaUnmapResources)
-    IPC_API int CudaMapGetArraysMapped(
+    // ---- CudaInterop.cu exported functions ----
+    IPC_API int __cdecl CudaSetDeviceSafe(int gpuId);
+    IPC_API int __cdecl CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes);
+    IPC_API int __cdecl CudaUnregister(cudaGraphicsResource* res);
+
+    // Map both resources and get mapped cudaArrays (resources remain mapped!)
+    IPC_API int __cdecl CudaMapGetArraysMapped(
         cudaGraphicsResource* inRes,
         cudaGraphicsResource* outRes,
         void** inArray,
         void** outArray);
 
-    IPC_API int CudaUnmapResources(
+    // Unmap both resources (must be called after processing)
+    IPC_API int __cdecl CudaUnmapResources(
         cudaGraphicsResource* inRes,
         cudaGraphicsResource* outRes);
 
     // Process: in(R16_UINT array) -> out(R16_UINT array)
-    IPC_API int CudaProcessArrays_R16_To_R16(
+    // enablePostFilter: apply extra filter after first stage (demo: 3x3 box blur)
+    IPC_API int __cdecl CudaProcessArrays_R16_To_R16(
         void* inArray,
         void* outArray,
         int w,
         int h,
         int window,
         int level,
-        int enableEdge);
-
+        int enableEdge,
+        int enablePostFilter);
 } // extern "C"
