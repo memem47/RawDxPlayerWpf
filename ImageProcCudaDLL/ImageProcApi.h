@@ -51,6 +51,8 @@ extern "C" {
     // Shutdown
     IPC_API int32_t __cdecl IPC_Shutdown();
 
+    IPC_API int32_t __cdecl IPC_ReadbackRaw16(void* dst, int32_t dstBytes);
+
 
     // ---- CudaInterop.cu exported functions ----
     IPC_API int __cdecl CudaSetDeviceSafe(int gpuId);

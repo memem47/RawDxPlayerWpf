@@ -189,7 +189,12 @@ namespace RawDxPlayerWpf
             }
 
             // ③ 出力(raw16)を readback して、CPUでWL/WWし表示
-            byte[] raw16Out = _renderer.ReadbackOutputRaw16();
+            //byte[] raw16Out = _renderer.ReadbackOutputRaw16();
+
+            // GPU->CPU readback is done in native (ImageProcApi.cpp) to avoid DxRenderer-side copy
+            byte[] raw16Out = (_processor as NativeImageProcessor)?.ReadbackRaw16(_seq.Width, _seq.Height);
+            
+
             byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16Out, _seq.Width, _seq.Height, _window, _level);
 
             _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgra, _seq.Width * 4, 0);

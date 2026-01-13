@@ -275,7 +275,8 @@ extern "C" int CudaProcessArrays_R16_To_R16(
 
     // --- Create output surface (from outArr) ---
     cudaSurfaceObject_t surfOut16 = 0;
-    e = CreateSurfFromArray(outArr, &surfOut16);
+    //e = CreateSurfFromArray(outArr, &surfOut16);
+    e = CreateSurfFromArray(inArr, &surfOut16);
     if (e != cudaSuccess) {
         cudaDestroyTextureObject(texMid16);
         cudaDestroySurfaceObject(surfMid16);

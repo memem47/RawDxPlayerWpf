@@ -35,6 +35,10 @@ namespace RawDxPlayerWpf.Processing
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int IPC_Shutdown();
 
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int IPC_ReadbackRaw16(IntPtr dst, int dstBytes);
+
+
         internal static IPC_Params MakeDefaultParams(int window, int level, int enableEdge)
         {
             return new IPC_Params
