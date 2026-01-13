@@ -36,11 +36,16 @@ extern "C" {
 
     // Single shared texture handle (DXGI_FORMAT_R16_UINT)
     IPC_API int32_t __cdecl IPC_Init(int32_t gpuId, void* ioSharedHandle);
+
+    // Params
     IPC_API int32_t __cdecl IPC_SetParams(const IPC_Params* p);
     IPC_API int32_t __cdecl IPC_Execute();
     IPC_API int32_t __cdecl IPC_Shutdown();
 
     // CUDA interop
+    IPC_API int32_t __cdecl IPC_ReadbackRaw16(void* dst, int32_t dstBytes);
+
+    // ---- CudaInterop.cu exported functions ----
     IPC_API int __cdecl CudaSetDeviceSafe(int gpuId);
     IPC_API int __cdecl CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes);
     IPC_API int __cdecl CudaUnregister(cudaGraphicsResource* res);

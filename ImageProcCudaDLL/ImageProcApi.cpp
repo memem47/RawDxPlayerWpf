@@ -16,12 +16,39 @@ static ComPtr<ID3D11Device>        g_device;
 static ComPtr<ID3D11DeviceContext> g_context;
 static ComPtr<ID3D11Texture2D>     g_ioTex;
 
+static ComPtr<ID3D11Texture2D>     g_stagingReadback;
+
 static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
 static std::mutex g_mtx;
 
 static int g_w = 0;
 static int g_h = 0;
+
+static HRESULT EnsureReadbackStaging()
+{
+    if (!g_ioTex || !g_device) return E_FAIL;
+    if (g_stagingReadback) return S_OK;
+
+    D3D11_TEXTURE2D_DESC src{};
+    g_ioTex->GetDesc(&src);
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = src.Width;
+    desc.Height = src.Height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = src.Format;                 // must be R16_UINT
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+
+    return g_device->CreateTexture2D(&desc, nullptr, g_stagingReadback.GetAddressOf());
+}
+
 
 static int32_t ValidateParams(const IPC_Params* p)
 {
@@ -79,6 +106,8 @@ extern "C" {
         g_w = (int)desc.Width;
         g_h = (int)desc.Height;
 
+
+        // CUDA device select
         int cr = CudaSetDeviceSafe((int)gpuId);
         if (cr != 0) return -1000 - cr;
 
@@ -157,7 +186,9 @@ extern "C" {
 
         CudaReleaseCache();
 
+        g_stagingReadback.Reset();
         g_ioTex.Reset();
+
         g_context.Reset();
         g_device.Reset();
 
@@ -166,5 +197,42 @@ extern "C" {
 
         return IPC_OK;
     }
+
+    
+    int32_t __cdecl IPC_ReadbackRaw16(void* dst, int32_t dstBytes)
+    {
+        if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+        if (!g_ioTex || !g_context) return IPC_ERR_NOT_INITIALIZED;
+        if (!dst || dstBytes <= 0) return IPC_ERR_INVALIDARG;
+
+        const int32_t need = (int32_t)(g_w * g_h * 2);
+        if (dstBytes < need) return IPC_ERR_INVALIDARG;
+
+        HRESULT hr = EnsureReadbackStaging();
+        if (FAILED(hr) || !g_stagingReadback) return IPC_ERR_INTERNAL;
+
+        // GPU copy -> staging
+        g_context->CopyResource(g_stagingReadback.Get(), g_ioTex.Get());
+        g_context->Flush();
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = g_context->Map(g_stagingReadback.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) return IPC_ERR_INTERNAL;
+
+        // copy row by row (RowPitch may be larger than width*2)
+        uint8_t* out = reinterpret_cast<uint8_t*>(dst);
+        const int rowBytes = g_w * 2;
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(mapped.pData);
+        const int srcPitch = (int)mapped.RowPitch;
+
+        for (int y = 0; y < g_h; y++)
+        {
+            memcpy(out + y * rowBytes, src + y * srcPitch, rowBytes);
+        }
+
+        g_context->Unmap(g_stagingReadback.Get(), 0);
+        return IPC_OK;
+    }
+
 
 } // extern "C"

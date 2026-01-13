@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Runtime.InteropServices;
+using System.Windows.Media.Media3D;
 
 namespace RawDxPlayerWpf.Processing
 {
@@ -39,6 +41,28 @@ namespace RawDxPlayerWpf.Processing
             if (!_initialized) return;
             NativeImageProc.IPC_Shutdown();
             _initialized = false;
+        }
+        
+        // NEW: Readback RAW16 in native side (GPU->CPU copy in C Main DLL)
+        public byte[] ReadbackRaw16(int width, int height)
+        {
+            if (!_initialized) return null;
+            int bytes = checked(width * height * 2);
+            var managed = new byte[bytes];
+
+            GCHandle h = default;
+            try
+            {
+                h = GCHandle.Alloc(managed, GCHandleType.Pinned);
+                IntPtr p = h.AddrOfPinnedObject();
+                int r = NativeImageProc.IPC_ReadbackRaw16(p, bytes);
+                if (r != 0) throw new InvalidOperationException($"IPC_ReadbackRaw16 failed: {r}");
+                return managed;
+            }
+            finally
+            {
+                if (h.IsAllocated) h.Free();
+            }
         }
     }
 }

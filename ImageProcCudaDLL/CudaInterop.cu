@@ -91,6 +91,23 @@ extern "C" __declspec(dllexport) int __cdecl CudaUnmapResource(cudaGraphicsResou
 {
     cudaError_t e = cudaGraphicsUnmapResources(1, &ioRes, 0);
     return (e == cudaSuccess) ? 0 : (int)e;
+
+    cudaArray_t ioArr = nullptr;
+
+    e = cudaGraphicsSubResourceGetMappedArray(&ioArr, ioRes, 0, 0);
+    if (e != cudaSuccess) return (int)e;
+
+    return 0;
+}
+
+extern "C" int CudaUnmapResources(cudaGraphicsResource* ioRes)
+{
+    cudaError_t e;
+
+    e = cudaGraphicsUnmapResources(1, &ioRes, 0);
+    if (e != cudaSuccess) return (int)e;
+
+    return 0;
 }
 
 // ============================================================
@@ -340,6 +357,7 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessArray_R16_Inplace(
             ThresholdU16 << <grid, block >> > (tex, surf, w, h, th);
             });
         if (e != cudaSuccess) return (int)e;
+
     }
 
     // Ensure final result is in IO
