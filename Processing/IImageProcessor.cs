@@ -4,7 +4,7 @@
     // 今回は未使用（null）でOK。
     public interface IImageProcessor
     {
-        void Initialize(int gpuId, System.IntPtr inputDxSharedHandle, System.IntPtr outputDxSharedHandle);
+        void Initialize(int gpuId, System.IntPtr inputDxSharedHandle);
         void SetParameters(object paramStruct);
         void Execute();
         void Shutdown();

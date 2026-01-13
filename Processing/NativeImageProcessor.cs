@@ -8,9 +8,9 @@ namespace RawDxPlayerWpf.Processing
     {
         private bool _initialized;
 
-        public void Initialize(int gpuId, IntPtr inputDxSharedHandle, IntPtr outputDxSharedHandle)
+        public void Initialize(int gpuId, IntPtr inputDxSharedHandle)
         {
-            int r = NativeImageProc.IPC_Init(gpuId, inputDxSharedHandle, outputDxSharedHandle);
+            int r = NativeImageProc.IPC_Init(gpuId, inputDxSharedHandle);
             if (r != 0) throw new InvalidOperationException($"IPC_Init failed: {r}");
             _initialized = true;
         }

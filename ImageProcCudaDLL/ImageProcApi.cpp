@@ -11,12 +11,10 @@
 using Microsoft::WRL::ComPtr;
 
 static cudaGraphicsResource* g_cudaIn = nullptr;
-static cudaGraphicsResource* g_cudaOut = nullptr;
 
 static ComPtr<ID3D11Device>        g_device;
 static ComPtr<ID3D11DeviceContext> g_context;
 static ComPtr<ID3D11Texture2D>     g_inputTex;
-static ComPtr<ID3D11Texture2D>     g_outputTex;
 
 static ComPtr<ID3D11Texture2D>     g_stagingReadback;
 
@@ -89,9 +87,9 @@ static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11D
 
 extern "C" {
 
-    int32_t __cdecl IPC_Init(int32_t gpuId, void* inSharedHandle, void* outSharedHandle)
+    int32_t __cdecl IPC_Init(int32_t gpuId, void* inSharedHandle)
     {
-        if (!inSharedHandle || !outSharedHandle) return IPC_ERR_INVALIDARG;
+        if (!inSharedHandle) return IPC_ERR_INVALIDARG;
 
         // reset
         IPC_Shutdown();
@@ -102,19 +100,12 @@ extern "C" {
         hr = g_device->OpenSharedResource((HANDLE)inSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_inputTex.GetAddressOf());
         if (FAILED(hr)) return -2;
 
-        hr = g_device->OpenSharedResource((HANDLE)outSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_outputTex.GetAddressOf());
-        if (FAILED(hr)) return -3;
-
         // Validate formats (IMPORTANT!)
-        D3D11_TEXTURE2D_DESC inDesc{}, outDesc{};
+        D3D11_TEXTURE2D_DESC inDesc{};
         g_inputTex->GetDesc(&inDesc);
-        g_outputTex->GetDesc(&outDesc);
-
-        if (inDesc.Width != outDesc.Width || inDesc.Height != outDesc.Height) return -4;
 
         // Expect: input=R16_UINT, output=R16_UINT
         if (inDesc.Format != DXGI_FORMAT_R16_UINT) return -5;
-        if (outDesc.Format != DXGI_FORMAT_R16_UINT) return -6;
 
         g_w = (int)inDesc.Width;
         g_h = (int)inDesc.Height;
@@ -126,9 +117,6 @@ extern "C" {
         // Register D3D11 textures to CUDA
         cr = CudaRegisterD3D11Texture(g_inputTex.Get(), &g_cudaIn);
         if (cr != 0) return -1100 - cr;
-
-        cr = CudaRegisterD3D11Texture(g_outputTex.Get(), &g_cudaOut);
-        if (cr != 0) return -1200 - cr;
 
         // default params
         IPC_Params p{};
@@ -164,13 +152,12 @@ extern "C" {
     int32_t __cdecl IPC_Execute()
     {
         if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
-        if (!g_cudaIn || !g_cudaOut) return IPC_ERR_NOT_INITIALIZED;
+        if (!g_cudaIn) return IPC_ERR_NOT_INITIALIZED;
 
         void* inArr = nullptr;
-        void* outArr = nullptr;
 
         // Map and get arrays (keep mapped until after kernel)
-        int cr = CudaMapGetArraysMapped(g_cudaIn, g_cudaOut, &inArr, &outArr);
+        int cr = CudaMapGetArraysMapped(g_cudaIn, &inArr);
         if (cr != 0) return -1300 - cr;
 
         // Copy params locally (avoid race)
@@ -184,13 +171,13 @@ extern "C" {
 
         // Run kernel(s): in(R16) -> out(R16) with optional second stage
         cr = CudaProcessArrays_R16_To_R16(
-            inArr, outArr, g_w, g_h,
+            inArr, g_w, g_h,
             p.window, p.level,
             p.enableEdge,
             enablePostFilter);
 
         // Unmap resources 반드시実行
-        int cr2 = CudaUnmapResources(g_cudaIn, g_cudaOut);
+        int cr2 = CudaUnmapResources(g_cudaIn);
 
         if (cr != 0) return -1400 - cr;
         if (cr2 != 0) return -1500 - cr2;
@@ -202,12 +189,10 @@ extern "C" {
     {
         g_initialized.store(false);
 
-        if (g_cudaOut) { CudaUnregister(g_cudaOut); g_cudaOut = nullptr; }
         if (g_cudaIn) { CudaUnregister(g_cudaIn);  g_cudaIn = nullptr; }
 
         g_stagingReadback.Reset();
         g_inputTex.Reset();
-        g_outputTex.Reset();
         g_context.Reset();
         g_device.Reset();
 

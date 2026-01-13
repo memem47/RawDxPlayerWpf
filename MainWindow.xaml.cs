@@ -108,7 +108,7 @@ namespace RawDxPlayerWpf
             try
             {
                 int gpuId = 0;
-                _processor.Initialize(gpuId, _renderer.InputSharedHandle, _renderer.OutputSharedHandle);
+                _processor.Initialize(gpuId, _renderer.InputSharedHandle);
                 _dllInitialized = true;
                 ApplyParamsToDll();
             }

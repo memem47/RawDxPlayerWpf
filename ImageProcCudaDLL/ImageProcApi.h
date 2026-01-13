@@ -40,7 +40,7 @@ extern "C" {
 #pragma pack(pop)
 
     // Init: gpuId + shared handles (both must be D3D11 shared Texture2D with DXGI_FORMAT_R16_UINT)
-    IPC_API int32_t __cdecl IPC_Init(int32_t gpuId, void* inSharedHandle, void* outSharedHandle);
+    IPC_API int32_t __cdecl IPC_Init(int32_t gpuId, void* inSharedHandle);
 
     // Params
     IPC_API int32_t __cdecl IPC_SetParams(const IPC_Params* p);
@@ -62,20 +62,16 @@ extern "C" {
     // Map both resources and get mapped cudaArrays (resources remain mapped!)
     IPC_API int __cdecl CudaMapGetArraysMapped(
         cudaGraphicsResource* inRes,
-        cudaGraphicsResource* outRes,
-        void** inArray,
-        void** outArray);
+        void** inArray);
 
     // Unmap both resources (must be called after processing)
     IPC_API int __cdecl CudaUnmapResources(
-        cudaGraphicsResource* inRes,
-        cudaGraphicsResource* outRes);
+        cudaGraphicsResource* inRes);
 
     // Process: in(R16_UINT array) -> out(R16_UINT array)
     // enablePostFilter: apply extra filter after first stage (demo: 3x3 box blur)
     IPC_API int __cdecl CudaProcessArrays_R16_To_R16(
         void* inArray,
-        void* outArray,
         int w,
         int h,
         int window,

@@ -29,22 +29,15 @@ extern "C" int CudaUnregister(cudaGraphicsResource* res)
 // Map and get arrays (keep mapped!)
 extern "C" int CudaMapGetArraysMapped(
     cudaGraphicsResource* inRes,
-    cudaGraphicsResource* outRes,
-    void** inArray,
-    void** outArray)
+    void** inArray)
 {
-    if (!inRes || !outRes || !inArray || !outArray) return (int)cudaErrorInvalidValue;
+    if (!inRes ||  !inArray) return (int)cudaErrorInvalidValue;
 
     cudaError_t e;
 
     e = cudaGraphicsMapResources(1, &inRes, 0);
     if (e != cudaSuccess) return (int)e;
 
-    e = cudaGraphicsMapResources(1, &outRes, 0);
-    if (e != cudaSuccess) {
-        cudaGraphicsUnmapResources(1, &inRes, 0);
-        return (int)e;
-    }
 
     cudaArray_t inArr = nullptr;
     cudaArray_t outArr = nullptr;
@@ -52,20 +45,14 @@ extern "C" int CudaMapGetArraysMapped(
     e = cudaGraphicsSubResourceGetMappedArray(&inArr, inRes, 0, 0);
     if (e != cudaSuccess) return (int)e;
 
-    e = cudaGraphicsSubResourceGetMappedArray(&outArr, outRes, 0, 0);
-    if (e != cudaSuccess) return (int)e;
 
     *inArray = (void*)inArr;
-    *outArray = (void*)outArr;
     return 0;
 }
 
-extern "C" int CudaUnmapResources(cudaGraphicsResource* inRes, cudaGraphicsResource* outRes)
+extern "C" int CudaUnmapResources(cudaGraphicsResource* inRes)
 {
     cudaError_t e;
-
-    e = cudaGraphicsUnmapResources(1, &outRes, 0);
-    if (e != cudaSuccess) return (int)e;
 
     e = cudaGraphicsUnmapResources(1, &inRes, 0);
     if (e != cudaSuccess) return (int)e;
@@ -209,7 +196,6 @@ static cudaError_t CreateSurfFromArray(cudaArray_t arr, cudaSurfaceObject_t* out
 
 extern "C" int CudaProcessArrays_R16_To_R16(
     void* inArrayVoid,
-    void* outArrayVoid,
     int w,
     int h,
     int window,
@@ -218,8 +204,7 @@ extern "C" int CudaProcessArrays_R16_To_R16(
     int enablePostFilter)
 {
     auto inArr = (cudaArray_t)inArrayVoid;
-    auto outArr = (cudaArray_t)outArrayVoid;
-    if (!inArr || !outArr) return (int)cudaErrorInvalidValue;
+    if (!inArr) return (int)cudaErrorInvalidValue;
 
     cudaError_t e;
 
