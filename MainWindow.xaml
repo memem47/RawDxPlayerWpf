@@ -110,7 +110,7 @@
 
                     <GroupBox Header="Effects" Margin="0,0,0,10">
                         <StackPanel Margin="10">
-                            <CheckBox x:Name="CbEdge" Content="Sobel" Margin="0,0,12,0"/>
+                            <CheckBox x:Name="CbEdge" Content="Sobel" Margin="0,0,12,0" Checked="CbEdge_Checked" Unchecked="CbEdge_Unchecked"/>
                             <CheckBox x:Name="CbBlur" Content="Blur" Margin="0,0,12,0" Checked="CbBlur_Checked" Unchecked="CbBlur_Unchecked"/>
                             <CheckBox x:Name="CbInvert" Content="Invert" Margin="0,0,12,0" Checked="CbInvert_Checked" Unchecked="CbInvert_Unchecked"/>
                             <CheckBox x:Name="CbThreshold" Content="Threshold" Margin="0,0,12,0" Checked="CbThreshold_Checked" Unchecked="CbThreshold_Unchecked"/>
