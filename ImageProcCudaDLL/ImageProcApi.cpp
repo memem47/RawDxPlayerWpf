@@ -1,5 +1,4 @@
-﻿#define IMAGEPROCCUDADLL_EXPORTS
-#include "ImageProcApi.h"
+﻿#include "ImageProcApi.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
