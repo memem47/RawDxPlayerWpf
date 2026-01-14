@@ -84,9 +84,11 @@
       <Generator>MSBuild:Compile</Generator>
       <SubType>Designer</SubType>
     </ApplicationDefinition>
-    <Compile Include="Processing\IImageProcessor.cs" />
-    <Compile Include="Processing\NativeImageProc.cs" />
-    <Compile Include="Processing\NativeImageProcessor.cs" />
+    <Compile Include="D3DImageHost.cs" />
+    <Compile Include="DxRenderer.cs" />
+    <Compile Include="IImageProcessor.cs" />
+    <Compile Include="NativeImageProc.cs" />
+    <Compile Include="NativeImageProcessor.cs" />
     <Compile Include="RawFrameReader.cs" />
     <Compile Include="RawSequence.cs" />
     <Page Include="MainWindow.xaml">
@@ -97,8 +99,6 @@
       <DependentUpon>App.xaml</DependentUpon>
       <SubType>Code</SubType>
     </Compile>
-    <Compile Include="Dx\D3DImageHost.cs" />
-    <Compile Include="Dx\DxRenderer.cs" />
     <Compile Include="MainWindow.xaml.cs">
       <DependentUpon>MainWindow.xaml</DependentUpon>
       <SubType>Code</SubType>
