@@ -169,7 +169,8 @@ namespace RawDxPlayerWpf
             var sw = Stopwatch.StartNew();
             
             byte[] raw16In = RawFrameReader.Load16RawBytes(path, _seq.Width, _seq.Height);
-            _renderer.UploadIoRaw16(raw16In);
+            //_renderer.UploadIoRaw16(raw16In);
+            (_processor as NativeImageProcessor)?.UploadRaw16(raw16In, _seq.Width, _seq.Height);
             sw.Stop();
             tLoadUp = sw.ElapsedMilliseconds;
 

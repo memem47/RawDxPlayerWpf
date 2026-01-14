@@ -16,8 +16,11 @@ extern "C" {
         IPC_OK = 0,
         IPC_ERR_INVALIDARG = 1,
         IPC_ERR_NOT_INITIALIZED = 2,
-        IPC_ERR_INTERNAL = 3
+        IPC_ERR_INTERNAL = 3,
+        IPC_ERR_INVALID_ARG = 4,
+        IPC_ERR_INVALID_STATE = 5
     };
+
 
 #pragma pack(push, 1)
     struct IPC_Params
@@ -66,6 +69,7 @@ extern "C" {
         int enableInvert,
         int enableThreshold,
         int thresholdValue);
-
+    
+    IPC_API int32_t __cdecl IPC_UploadRaw16(const void* src, int32_t srcBytes);
     IPC_API int __cdecl CudaReleaseCache();
 }

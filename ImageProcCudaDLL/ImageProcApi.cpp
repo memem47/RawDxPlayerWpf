@@ -15,6 +15,7 @@ static ComPtr<ID3D11Device>        g_device;
 static ComPtr<ID3D11DeviceContext> g_context;
 static ComPtr<ID3D11Texture2D>     g_ioTex;
 
+static ComPtr<ID3D11Texture2D>     g_stagingUpload;
 static ComPtr<ID3D11Texture2D>     g_stagingReadback;
 
 static std::atomic<bool> g_initialized{ false };
@@ -23,6 +24,23 @@ static std::mutex g_mtx;
 
 static int g_w = 0;
 static int g_h = 0;
+
+static HRESULT EnsureUploadStaging()
+{
+    if (g_stagingUpload) return S_OK;
+    if (!g_device || !g_ioTex) return E_FAIL;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    g_ioTex->GetDesc(&desc);
+
+    // CPU書き込み用 staging
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.MiscFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    return g_device->CreateTexture2D(&desc, nullptr, g_stagingUpload.GetAddressOf());
+}
 
 static HRESULT EnsureReadbackStaging()
 {
@@ -185,6 +203,7 @@ extern "C" {
 
         CudaReleaseCache();
 
+        g_stagingUpload.Reset();
         g_stagingReadback.Reset();
         g_ioTex.Reset();
 
@@ -193,6 +212,40 @@ extern "C" {
 
         g_w = 0;
         g_h = 0;
+
+        return IPC_OK;
+    }
+
+    int32_t __cdecl IPC_UploadRaw16(const void* src, int32_t srcBytes)
+    {
+        if (!src) return IPC_ERR_INVALID_ARG;
+        if (!g_device || !g_context || !g_ioTex) return IPC_ERR_NOT_INITIALIZED;
+        if (g_w <= 0 || g_h <= 0) return IPC_ERR_INVALID_STATE;
+
+        const int32_t required = g_w * g_h * 2;
+        if (srcBytes < required) return IPC_ERR_INVALID_ARG;
+
+        HRESULT hr = EnsureUploadStaging();
+        if (FAILED(hr) || !g_stagingUpload) return IPC_ERR_INTERNAL;
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = g_context->Map(g_stagingUpload.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
+        if (FAILED(hr)) return IPC_ERR_INTERNAL;
+
+        const uint8_t* in = reinterpret_cast<const uint8_t*>(src);
+        const int rowBytes = g_w * 2;
+        uint8_t* dst = reinterpret_cast<uint8_t*>(mapped.pData);
+        const int dstPitch = (int)mapped.RowPitch;
+
+        for (int y = 0; y < g_h; y++)
+        {
+            memcpy(dst + y * dstPitch, in + y * rowBytes, rowBytes);
+        }
+
+        g_context->Unmap(g_stagingUpload.Get(), 0);
+
+        // staging -> IO
+        g_context->CopyResource(g_ioTex.Get(), g_stagingUpload.Get());
 
         return IPC_OK;
     }

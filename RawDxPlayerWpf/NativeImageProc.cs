@@ -61,6 +61,9 @@ namespace RawDxPlayerWpf.Processing
             };
         }
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int IPC_UploadRaw16(IntPtr src, int srcBytes);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int IPC_ReadbackRaw16(IntPtr dst, int dstBytes);
     }
 }
