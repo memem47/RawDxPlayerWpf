@@ -19,7 +19,6 @@ namespace RawDxPlayerWpf
         private RawSequence _seq;
         private int _index;
 
-        private DxRenderer _renderer;
         private WriteableBitmap _wb;
 
         private readonly IImageProcessor _processor = new NativeImageProcessor();
@@ -40,6 +39,7 @@ namespace RawDxPlayerWpf
         // export
         private string _outputDir;
 
+        private IntPtr _ioSharedHandle = IntPtr.Zero;
         public MainWindow()
         {
             InitializeComponent();
@@ -72,7 +72,10 @@ namespace RawDxPlayerWpf
             }
             catch { /* ignore */ }
 
-            _renderer?.Dispose();
+            var h = _ioSharedHandle;
+            _ioSharedHandle = IntPtr.Zero;
+            if (h != IntPtr.Zero)
+                NativeImageProc.IPC_DestroyIoSharedHandle(h);
         }
 
         private void BtnOpen_Click(object sender, RoutedEventArgs e)
@@ -90,13 +93,29 @@ namespace RawDxPlayerWpf
 
         private void LoadSequenceFromFile(string filePath)
         {
+            int gpuId = 0;
             StopPlayback();
 
             _seq = RawSequence.FromAnyFileInFolder(filePath);
             _index = 0;
 
-            _renderer?.Dispose();
-            _renderer = new DxRenderer(_seq.Width, _seq.Height, gpuId: 0);
+            // 既存の shared handle があれば破棄
+            var h = _ioSharedHandle;
+            _ioSharedHandle = IntPtr.Zero;
+            if (h != IntPtr.Zero)
+                NativeImageProc.IPC_DestroyIoSharedHandle(h);
+
+            // C++側で shared texture + handle を生成
+            _ioSharedHandle = NativeImageProc.IPC_CreateIoSharedHandle(
+                gpuId: gpuId,
+                width: _seq.Width,
+                height: _seq.Height);
+
+            if (_ioSharedHandle == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("IPC_CreateIoSharedHandle failed.");
+            }
+
 
             _wb = new WriteableBitmap(_seq.Width, _seq.Height, 96, 96,
                 PixelFormats.Bgra32, null);
@@ -105,8 +124,7 @@ namespace RawDxPlayerWpf
             // init dll (single IO handle)
             try
             {
-                int gpuId = 0;
-                _processor.Initialize(gpuId, _renderer.IoSharedHandle);
+                _processor.Initialize(gpuId, _ioSharedHandle);
                 _dllInitialized = true;
                 ApplyParamsToDll();
             }
@@ -152,7 +170,7 @@ namespace RawDxPlayerWpf
         /// </summary>
         private void RenderNextFrame(bool forceSameIndex = false)
         {
-            if (_seq == null || _renderer == null) return;
+            if (_seq == null || !_dllInitialized) return;
 
             var swTotal = Stopwatch.StartNew();
             long tLoadUp = 0, tCuda = 0, tRead = 0, tDisp = 0;

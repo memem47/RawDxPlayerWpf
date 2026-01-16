@@ -72,4 +72,9 @@ extern "C" {
     
     IPC_API int32_t __cdecl IPC_UploadRaw16(const void* src, int32_t srcBytes);
     IPC_API int __cdecl CudaReleaseCache();
+
+    IPC_API void* __cdecl IPC_CreateIoSharedHandle(int32_t gpuId, int32_t width, int32_t height);
+    IPC_API void   __cdecl IPC_DestroyIoSharedHandle(void* sharedHandle);
+    IPC_API int32_t __cdecl IPC_GetLastHr();
+    IPC_API const char* __cdecl IPC_GetLastErr();
 }

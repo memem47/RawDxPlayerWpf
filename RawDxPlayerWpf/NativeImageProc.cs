@@ -65,5 +65,13 @@ namespace RawDxPlayerWpf.Processing
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int IPC_ReadbackRaw16(IntPtr dst, int dstBytes);
+
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr IPC_CreateIoSharedHandle(int gpuId, int width, int height);
+
+        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void IPC_DestroyIoSharedHandle(IntPtr sharedHandle);
+
     }
 }

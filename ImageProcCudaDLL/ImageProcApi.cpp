@@ -1,6 +1,7 @@
 ﻿#include "ImageProcApi.h"
 
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <dxgi.h>
 #include <wrl/client.h>
 
@@ -17,6 +18,9 @@ static ComPtr<ID3D11Texture2D>     g_ioTex;
 
 static ComPtr<ID3D11Texture2D>     g_stagingUpload;
 static ComPtr<ID3D11Texture2D>     g_stagingReadback;
+
+static ComPtr<ID3D11Texture2D>     g_ownedSharedTex;  // Createした実体（Init前）
+static HANDLE                      g_ownedHandle = nullptr;
 
 static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
@@ -284,6 +288,96 @@ extern "C" {
 
         g_context->Unmap(g_stagingReadback.Get(), 0);
         return IPC_OK;
+    }
+
+
+    static int32_t CreateDeviceForGpu(int32_t gpuId, ID3D11Device** dev, ID3D11DeviceContext** ctx)
+    {
+        // 既にあなたのコードに「gpuIdに対応するIDXGIAdapterを選ぶ」関数があるならそれを使う
+        ComPtr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return -1;
+
+        ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapters1((UINT)gpuId, &adapter))) return -2;
+
+        UINT flags = 0;
+#ifdef _DEBUG
+        flags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+        D3D_FEATURE_LEVEL fl;
+        HRESULT hr = D3D11CreateDevice(
+            adapter.Get(),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            nullptr,
+            flags,
+            nullptr, 0,
+            D3D11_SDK_VERSION,
+            dev,
+            &fl,
+            ctx
+        );
+        if (FAILED(hr)) return -3;
+        return 0;
+    }
+    // 失敗原因をC#へ返すため（後述のGetLastHr/GetLastErr用）
+    static HRESULT g_lastHr = S_OK;
+    static const char* g_lastErr = "OK";
+    static void SetErr(HRESULT hr, const char* msg) { g_lastHr = hr; g_lastErr = msg; }
+    IPC_API void* __cdecl IPC_CreateIoSharedHandle(int32_t gpuId, int32_t width, int32_t height)
+    {
+        // 既存破棄（Destroyと同様、所有しているものだけ）
+        if (g_ownedHandle)
+        {
+            HANDLE old = g_ownedHandle;
+            g_ownedHandle = nullptr;
+            CloseHandle(old);
+        }
+        g_ownedSharedTex.Reset();
+
+        // ★ ここは IPC_Init と同じ関数を使う（すでに上にある）
+        ComPtr<ID3D11Device> dev;
+        ComPtr<ID3D11DeviceContext> ctx;
+        HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, dev.GetAddressOf(), ctx.GetAddressOf());
+        if (FAILED(hr)) return nullptr;
+
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = (UINT)width;
+        desc.Height = (UINT)height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R16_UINT;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+
+        // CUDA側で使うので最低限入れる
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+        // ★ OpenSharedResource 互換のレガシー shared handle
+        desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+        hr = dev->CreateTexture2D(&desc, nullptr, g_ownedSharedTex.GetAddressOf());
+        if (FAILED(hr)) return nullptr;
+
+        ComPtr<IDXGIResource> res;
+        hr = g_ownedSharedTex.As(&res);
+        if (FAILED(hr)) return nullptr;
+
+        HANDLE h = nullptr;
+        hr = res->GetSharedHandle(&h);
+        if (FAILED(hr) || !h) return nullptr;
+
+        g_ownedHandle = h;
+        return (void*)g_ownedHandle;
+    }
+
+
+    IPC_API void __cdecl IPC_DestroyIoSharedHandle(void* sharedHandle)
+    {
+        if ((HANDLE)sharedHandle == g_ownedHandle)
+        {
+            g_ownedHandle = nullptr;
+        }
     }
 
 
