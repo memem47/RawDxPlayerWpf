@@ -10,7 +10,7 @@ from PySide6.QtGui import QImage, QPixmap, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSlider, QSpinBox, QGroupBox,
-    QFormLayout, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
+    QFormLayout, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QComboBox
 )
 
 
@@ -99,6 +99,19 @@ def qimage_from_gray_u8(gray: np.ndarray) -> QImage:
     # Important: copy to own memory (otherwise numpy buffer lifetime issues)
     return qimg.copy()
 
+def normalize_minmax_to_u8(img: np.ndarray) -> np.ndarray:
+    """
+    任意の数値配列を min-max で 0..255 に正規化して uint8 にする。
+    差分(i32)表示用。定数画像の場合は0で埋める。
+    """
+    x = img.astype(np.float32)
+    mn = float(np.min(x))
+    mx = float(np.max(x))
+    if mx - mn < 1e-12:
+        return np.zeros_like(x, dtype=np.uint8)
+    y = (x - mn) / (mx - mn)
+    y = np.clip(y, 0.0, 1.0)
+    return (y * 255.0 + 0.5).astype(np.uint8)
 
 # -----------------------------
 # Zoomable graphics view with mouse tracking
@@ -119,24 +132,24 @@ class ImageView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
 
-        self._img_u16: Optional[np.ndarray] = None
+        self._img: Optional[np.ndarray] = None
         self._w = 0
         self._h = 0
 
-    def set_image(self, pixmap: QPixmap, img_u16: np.ndarray):
+    def set_image(self, pixmap: QPixmap, img: np.ndarray):
         self._pixmap_item.setPixmap(pixmap)
-        self._img_u16 = img_u16
-        self._h, self._w = img_u16.shape
+        self._img = img
+        self._h, self._w = img.shape
         self.scene().setSceneRect(0, 0, self._w, self._h)
 
     def clear_image(self):
         self._pixmap_item.setPixmap(QPixmap())
-        self._img_u16 = None
+        self._img = None
         self._w = self._h = 0
         self.scene().setSceneRect(0, 0, 0, 0)
 
     def wheelEvent(self, event):
-        if self._img_u16 is None:
+        if self._img is None:
             return super().wheelEvent(event)
         angle = event.angleDelta().y()
         if angle == 0:
@@ -146,7 +159,7 @@ class ImageView(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         super().mouseMoveEvent(event)
-        if self._img_u16 is None:
+        if self._img is None:
             self.mouseOut.emit()
             return
 
@@ -154,7 +167,7 @@ class ImageView(QGraphicsView):
         x = int(p.x())
         y = int(p.y())
         if 0 <= x < self._w and 0 <= y < self._h:
-            val = int(self._img_u16[y, x])
+            val = int(self._img[y, x])
             self.mouseImagePos.emit(x, y, val)
         else:
             self.mouseOut.emit()
@@ -202,6 +215,11 @@ class MainWindow(QMainWindow):
         self.current: Optional[LoadedRaw] = None
         self.current_dir: str = ""
 
+        # --- diff feature ---
+        self.ref: Optional[LoadedRaw] = None          # 差分に使う画像（u16）
+        self.diff_i32: Optional[np.ndarray] = None    # base - ref（i32）
+        self.view_mode: str = "base"                  # "base" | "ref" | "diff"
+        
         # UI
         root = QWidget()
         self.setCentralWidget(root)
@@ -212,18 +230,28 @@ class MainWindow(QMainWindow):
         v.addLayout(top)
 
         self.btn_select = QPushButton("RAW選択...")
+        self.btn_select_diff = QPushButton("差分画像選択...")
         self.btn_prev = QPushButton("前の画像")
         self.btn_next = QPushButton("次の画像")
         self.btn_reset_zoom = QPushButton("ズームリセット")
+        self.cmb_view = QComboBox()
+        self.cmb_view.addItems(["元画像", "差分元画像", "差分画像(元-差分元)"])
 
         top.addWidget(self.btn_select)
+        top.addWidget(self.btn_select_diff)
         top.addWidget(self.btn_prev)
         top.addWidget(self.btn_next)
         top.addWidget(self.btn_reset_zoom)
+        top.addWidget(QLabel("表示:"))
+        top.addWidget(self.cmb_view)
 
         self.lbl_name = QLabel("（未選択）")
         self.lbl_name.setTextInteractionFlags(Qt.TextSelectableByMouse)
         v.addWidget(self.lbl_name)
+
+        self.lbl_diff = QLabel("差分元: (未選択)")
+        self.lbl_diff.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.lbl_diff)
 
         # Slider for index
         nav = QHBoxLayout()
@@ -272,6 +300,16 @@ class MainWindow(QMainWindow):
 
         # Info labels
         self.lbl_mouse = QLabel("x=?, y=?, value=?")
+                # 右パネルのガタつき対策：複数行 + 等幅フォント + 幅固定
+        self.lbl_mouse.setTextFormat(Qt.PlainText)
+        self.lbl_mouse.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.lbl_mouse.setWordWrap(False)
+        self.lbl_mouse.setMinimumWidth(320)   # ここは好みで 300〜400
+        self.lbl_mouse.setFixedHeight(70)     # 2〜3行表示の高さ確保
+
+        font = self.lbl_mouse.font()
+        font.setFamily("Consolas")  # Windows 等幅
+        self.lbl_mouse.setFont(font)
         self.lbl_zoom = QLabel("zoom=1.00")
         right.addWidget(QGroupBox("情報"))
         right.addWidget(self.lbl_mouse)
@@ -285,9 +323,11 @@ class MainWindow(QMainWindow):
 
         # Signals
         self.btn_select.clicked.connect(self.on_select_raw)
+        self.btn_select_diff.clicked.connect(self.on_select_diff_raw)
         self.btn_prev.clicked.connect(lambda: self.step_index(-1))
         self.btn_next.clicked.connect(lambda: self.step_index(+1))
         self.btn_reset_zoom.clicked.connect(self.on_reset_zoom)
+        self.cmb_view.currentIndexChanged.connect(self.on_view_mode_changed)
 
         self.slider.valueChanged.connect(self.on_slider_changed)
         self.spin_index.valueChanged.connect(self.on_spin_changed)
@@ -334,6 +374,8 @@ class MainWindow(QMainWindow):
         last_wl = self.settings.value("last_wl", 32768, type=int)
         last_ww = self.settings.value("last_ww", 65535, type=int)
         last_zoom = self.settings.value("last_zoom", 1.0, type=float)
+        last_diff_path = self.settings.value("last_diff_path", "", type=str)
+        last_view_mode = self.settings.value("last_view_mode", "base", type=str)
 
         # Pre-set WL/WW (may be overridden after first image load)
         self._set_wl_ww_ui(last_wl, max(1, last_ww), block_signals=True)
@@ -345,7 +387,22 @@ class MainWindow(QMainWindow):
                 self._sync_nav_widgets()
                 self.load_and_show(self.index, keep_wlww=True)
                 self.view.set_zoom(last_zoom)
+                # 差分元も復元（サイズが合えば）
+                if last_diff_path and os.path.isfile(last_diff_path):
+                    try:
+                        ref = self.load_raw_u16(last_diff_path)
+                        if ref.shape == self.current.shape:
+                            self.ref = ref
+                            self.lbl_diff.setText(f"差分元: {ref.path}")
+                            self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
+                    except Exception:
+                        pass
 
+                # 表示モード復元
+                mode_to_idx = {"base": 0, "ref": 1, "diff": 2}
+                self.view_mode = last_view_mode if last_view_mode in mode_to_idx else "base"
+                self.cmb_view.setCurrentIndex(mode_to_idx.get(self.view_mode, 0))
+                self.render_by_mode()
     def save_state(self):
         last_path = ""
         if self.raw_files and 0 <= self.index < len(self.raw_files):
@@ -493,21 +550,23 @@ class MainWindow(QMainWindow):
             wl = int((loaded.vmin + loaded.vmax) / 2)
             ww = max(1, int(loaded.vmax - loaded.vmin))
             self._set_wl_ww_ui(wl, ww, block_signals=True)
+        # もし差分元が設定済みで同サイズなら、差分を再計算
+        if self.ref is not None:
+            if self.ref.shape == self.current.shape:
+                self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
+            else:
+                # サイズが合わなくなったら解除
+                self.ref = None
+                self.diff_i32 = None
+                self.lbl_diff.setText("差分元: (未選択)")
+                if self.view_mode in ("ref", "diff"):
+                    self.view_mode = "base"
+                    self.cmb_view.setCurrentIndex(0)
 
-        self.render_current()
+        self.render_by_mode()
 
     def render_current(self):
-        if self.current is None:
-            self.view.clear_image()
-            return
-        wl = float(self.spn_wl.value())
-        ww = float(self.spn_ww.value())
-
-        gray = apply_window_u16_to_u8(self.current.img_u16, wl, ww)
-        qimg = qimage_from_gray_u8(gray)
-        pix = QPixmap.fromImage(qimg)
-
-        self.view.set_image(pix, self.current.img_u16)
+        self.render_by_mode()
 
     # -----------------------------
     # WL/WW sync
@@ -535,19 +594,49 @@ class MainWindow(QMainWindow):
         wl = int(self.sender().value())
         ww = int(self.spn_ww.value())
         self._set_wl_ww_ui(wl, ww, block_signals=True)
-        self.render_current()
+        if self.view_mode != "diff":
+            self.render_current()
 
     def on_ww_changed(self, v: int):
         ww = int(self.sender().value())
         wl = int(self.spn_wl.value())
         self._set_wl_ww_ui(wl, ww, block_signals=True)
-        self.render_current()
+        if self.view_mode != "diff":
+            self.render_current()
 
     # -----------------------------
     # Mouse info
     # -----------------------------
     def on_mouse_pos(self, x: int, y: int, value: int):
-        self.lbl_mouse.setText(f"x={x}, y={y}, value={value}")
+        if self.current is None:
+            self.lbl_mouse.setText("x=?, y=?, value=?")
+            return
+
+        base_v = int(self.current.img_u16[y, x])
+
+        if self.view_mode == "diff":
+            diff_v = int(value)
+            if self.ref is not None:
+                ref_v = int(self.ref.img_u16[y, x])
+                # 改行 + 桁揃え
+                self.lbl_mouse.setText(
+                    f"x={x:4d}, y={y:4d}\n"
+                    f"base={base_v:6d}, ref={ref_v:6d}\n"
+                    f"diff={diff_v:7d}"
+                )
+            else:
+                self.lbl_mouse.setText(
+                    f"x={x:4d}, y={y:4d}\n"
+                    f"base={base_v:6d}\n"
+                    f"diff={diff_v:7d}"
+                )
+            return
+
+        # base/ref表示中（従来）→ ここも改行にすると安定
+        self.lbl_mouse.setText(
+            f"x={x:4d}, y={y:4d}\n"
+            f"value={int(value):6d}"
+        )
 
     def on_mouse_out(self):
         self.lbl_mouse.setText("x=?, y=?, value=?")
@@ -559,6 +648,100 @@ class MainWindow(QMainWindow):
         self.view.reset_zoom()
         self.lbl_zoom.setText(f"zoom={self.view.get_zoom():.2f}")
 
+    def on_select_diff_raw(self):
+        if self.current is None:
+            QMessageBox.information(self, "Info", "先に元画像（RAW選択）を読み込んでください。")
+            return
+
+        start_dir = self.current_dir or self.settings.value("last_dir", "", type=str) or os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "差分元画像を選択",
+            start_dir,
+            "RAW files (*.raw *.bin);;All files (*.*)"
+        )
+        if not path:
+            return
+
+        # 読み込み（u16）
+        try:
+            ref = self.load_raw_u16(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Load error", f"{os.path.basename(path)}\n\n{e}")
+            return
+
+        # サイズチェック（②）
+        if self.current.shape != ref.shape:
+            QMessageBox.warning(
+                self,
+                "サイズ不一致",
+                f"サイズが違います。\n\n"
+                f"元: {self.current.shape[1]}x{self.current.shape[0]}\n"
+                f"差分元: {ref.shape[1]}x{ref.shape[0]}"
+            )
+            self.ref = None
+            self.diff_i32 = None
+            self.lbl_diff.setText("差分元: (未選択)")
+            return
+
+        self.ref = ref
+        self.lbl_diff.setText(f"差分元: {ref.path}")
+
+        # 差分計算（③）
+        self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
+
+        # 設定保存（任意）
+        self.settings.setValue("last_diff_path", path)
+
+        # 表示が差分/差分元なら即更新
+        self.render_by_mode()
+
+    def on_view_mode_changed(self, idx: int):
+        # 0: base, 1: ref, 2: diff
+        self.view_mode = ["base", "ref", "diff"][idx]
+        self.settings.setValue("last_view_mode", self.view_mode)
+        self.render_by_mode()
+
+    def render_by_mode(self):
+        if self.current is None:
+            self.view.clear_image()
+            return
+
+        if self.view_mode == "base":
+            self.render_base_or_ref(self.current.img_u16, use_wlww=True)
+            return
+
+        if self.view_mode == "ref":
+            if self.ref is None:
+                QMessageBox.information(self, "Info", "差分元画像が未選択です。")
+                self.cmb_view.setCurrentIndex(0)
+                return
+            self.render_base_or_ref(self.ref.img_u16, use_wlww=True)
+            return
+
+        # diff
+        if self.ref is None or self.diff_i32 is None:
+            QMessageBox.information(self, "Info", "差分元画像が未選択です。")
+            self.cmb_view.setCurrentIndex(0)
+            return
+
+        # 差分表示はmin-maxで表示（WL/WWは無視）
+        gray = normalize_minmax_to_u8(self.diff_i32)
+        qimg = qimage_from_gray_u8(gray)
+        pix = QPixmap.fromImage(qimg)
+        self.view.set_image(pix, self.diff_i32)
+
+    def render_base_or_ref(self, img_u16: np.ndarray, use_wlww: bool):
+        if use_wlww:
+            wl = float(self.spn_wl.value())
+            ww = float(self.spn_ww.value())
+            gray = apply_window_u16_to_u8(img_u16, wl, ww)
+        else:
+            gray = normalize_minmax_to_u8(img_u16)
+
+        qimg = qimage_from_gray_u8(gray)
+        pix = QPixmap.fromImage(qimg)
+        self.view.set_image(pix, img_u16)
 
 def main():
     app = QApplication([])
