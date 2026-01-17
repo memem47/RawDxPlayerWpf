@@ -25,6 +25,8 @@ extern "C" {
 #pragma pack(push, 1)
     struct IPC_Params
     {
+        int32_t width;
+        int32_t height;
         uint32_t sizeBytes;   // sizeof(IPC_Params)
         uint32_t version;     // 1
 
@@ -39,6 +41,7 @@ extern "C" {
 
     // Single shared texture handle (DXGI_FORMAT_R16_UINT)
     IPC_API int32_t __cdecl IPC_Init(int32_t gpuId, void* ioSharedHandle);
+    IPC_API int32_t __cdecl IPC_InitWithIoBuffer(int32_t gpuId, void* ioBufferPtr);
 
     // Params
     IPC_API int32_t __cdecl IPC_SetParams(const IPC_Params* p);
@@ -47,14 +50,22 @@ extern "C" {
 
     // CUDA interop
     IPC_API int32_t __cdecl IPC_ReadbackRaw16(void* dst, int32_t dstBytes);
+    IPC_API int32_t __cdecl IPC_ReadbackRaw16FromBuffer(void* dst, int32_t dstBytes);
 
     // ---- CudaInterop.cu exported functions ----
     IPC_API int __cdecl CudaSetDeviceSafe(int gpuId);
     IPC_API int __cdecl CudaRegisterD3D11Texture(void* tex2D, cudaGraphicsResource** outRes);
     IPC_API int __cdecl CudaUnregister(cudaGraphicsResource* res);
 
+    IPC_API int __cdecl CudaRegisterD3D11Buffer(void* buf, cudaGraphicsResource** outRes);
+
     // Map single resource and get mapped cudaArray (resource remains mapped)
     IPC_API int __cdecl CudaMapGetArrayMapped(cudaGraphicsResource* ioRes, void** ioArray);
+
+    // Map single resource and get mapped device pointer (resource remains mapped)
+    IPC_API int __cdecl CudaMapGetPointerMapped(cudaGraphicsResource* ioRes, void** devPtr, size_t* outBytes);
+
+    
     IPC_API int __cdecl CudaUnmapResource(cudaGraphicsResource* ioRes);
 
     // In-place processing using intermediate array(s) inside CUDA
@@ -70,11 +81,30 @@ extern "C" {
         int enableThreshold,
         int thresholdValue);
     
+    // In-place processing for linear buffer (uint16_t*)
+    IPC_API int __cdecl CudaProcessBuffer_R16_Inplace(
+        void* ioDevPtr,
+        int w,
+        int h,
+        int window,
+        int level,
+        int enableEdge,
+        int enableBlur,
+        int enableInvert,
+        int enableThreshold,
+        int thresholdValue);
+
     IPC_API int32_t __cdecl IPC_UploadRaw16(const void* src, int32_t srcBytes);
+    IPC_API int32_t __cdecl IPC_UploadRaw16ToBuffer(const void* src, int32_t srcBytes, int32_t width, int32_t height);
+    
     IPC_API int __cdecl CudaReleaseCache();
 
     IPC_API void* __cdecl IPC_CreateIoSharedHandle(int32_t gpuId, int32_t width, int32_t height);
     IPC_API void   __cdecl IPC_DestroyIoSharedHandle(void* sharedHandle);
+
+    IPC_API void* __cdecl IPC_CreateIoBuffer(int32_t gpuId, int32_t width, int32_t height);
+    IPC_API void __cdecl IPC_ReleaseD3D11Resource(void* d3d11Resource);
+
     IPC_API int32_t __cdecl IPC_GetLastHr();
     IPC_API const char* __cdecl IPC_GetLastErr();
 }

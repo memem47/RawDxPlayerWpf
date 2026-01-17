@@ -36,6 +36,37 @@ static cudaError_t EnsureMidArrayR16(int w, int h)
     return cudaSuccess;
 }
 
+static unsigned short* g_midBuf = nullptr;
+static int g_midW2 = 0;
+static int g_midH2 = 0;
+
+static cudaError_t EnsureMidBufferR16(int w, int h)
+{
+    if (g_midBuf && g_midW2 == w && g_midH2 == h) return cudaSuccess;
+
+    if (g_midBuf)
+    {
+        cudaError_t e0 = cudaFree(g_midBuf);
+        g_midBuf = nullptr;
+        g_midW2 = g_midH2 = 0;
+        if (e0 != cudaSuccess) return e0;
+    }
+
+    size_t bytes = (size_t)w * (size_t)h * sizeof(unsigned short);
+    cudaError_t e = cudaMalloc((void**)&g_midBuf, bytes);
+    if (e != cudaSuccess)
+    {
+        g_midBuf = nullptr;
+        g_midW2 = g_midH2 = 0;
+        return e;
+    }
+
+    g_midW2 = w;
+    g_midH2 = h;
+    return cudaSuccess;
+}
+
+
 extern "C" __declspec(dllexport) int __cdecl CudaReleaseCache()
 {
     if (g_midArr)
@@ -44,6 +75,14 @@ extern "C" __declspec(dllexport) int __cdecl CudaReleaseCache()
         g_midArr = nullptr;
         g_midW = g_midH = 0;
         return (e == cudaSuccess) ? 0 : (int)e;
+    }
+
+    if (g_midBuf)
+    {
+        cudaError_t e2 = cudaFree(g_midBuf);
+        g_midBuf = nullptr;
+        g_midW2 = g_midH2 = 0;
+        if (e2 != cudaSuccess) return (int)e2;
     }
     return 0;
 }
@@ -65,6 +104,14 @@ extern "C" __declspec(dllexport) int __cdecl CudaRegisterD3D11Texture(void* tex2
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
+
+extern "C" __declspec(dllexport) int __cdecl CudaRegisterD3D11Buffer(void* buf, cudaGraphicsResource** outRes)
+{
+    auto* t = reinterpret_cast<ID3D11Buffer*>(buf);
+    cudaError_t e = cudaGraphicsD3D11RegisterResource(outRes, t, cudaGraphicsRegisterFlagsNone);
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
 extern "C" __declspec(dllexport) int __cdecl CudaUnregister(cudaGraphicsResource* res)
 {
     if (!res) return 0;
@@ -72,7 +119,8 @@ extern "C" __declspec(dllexport) int __cdecl CudaUnregister(cudaGraphicsResource
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
-extern "C" __declspec(dllexport) int __cdecl CudaMapGetArrayMapped(cudaGraphicsResource* ioRes, void** ioArray)
+extern "C" __declspec(dllexport) int __cdecl CudaMapGetArrayMapped(
+    cudaGraphicsResource* ioRes, void** ioArray)
 {
     if (!ioRes || !ioArray) return (int)cudaErrorInvalidValue;
 
@@ -86,6 +134,25 @@ extern "C" __declspec(dllexport) int __cdecl CudaMapGetArrayMapped(cudaGraphicsR
     *ioArray = (void*)arr;
     return 0;
 }
+
+extern "C" __declspec(dllexport) int __cdecl CudaMapGetPointerMapped(
+    cudaGraphicsResource* ioRes, void** devPtr, size_t* outBytes)
+{
+    if (!ioRes || !devPtr) return (int)cudaErrorInvalidValue;
+
+    cudaError_t e = cudaGraphicsMapResources(1, &ioRes, 0);
+    if (e != cudaSuccess) return (int)e;
+
+    void* p = nullptr;
+    size_t bytes = 0;
+    e = cudaGraphicsResourceGetMappedPointer(&p, &bytes, ioRes);
+    if (e != cudaSuccess) return (int)e;
+
+    *devPtr = p;
+    if (outBytes) *outBytes = bytes;
+    return 0;
+}
+
 
 extern "C" __declspec(dllexport) int __cdecl CudaUnmapResource(cudaGraphicsResource* ioRes)
 {
@@ -260,6 +327,97 @@ __global__ void CopyU16(cudaTextureObject_t texIn16, cudaSurfaceObject_t surfOut
     surf2Dwrite(v, surfOut16, x * (int)sizeof(unsigned short), y);
 }
 
+__device__ __forceinline__ int clampi(int v, int lo, int hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+__global__ void WLWW16Kernel_Buf(const unsigned short* in, unsigned short* out,
+    int w, int h, int window, int level)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    unsigned short v = in[y * w + x];
+    out[y * w + x] = wlww_to_u16(v, window, level);
+}
+
+__global__ void Sobel16Kernel_Buf(const unsigned short* in, unsigned short* out,
+    int w, int h, int window, int level)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    int xm1 = clampi(x - 1, 0, w - 1);
+    int xp1 = clampi(x + 1, 0, w - 1);
+    int ym1 = clampi(y - 1, 0, h - 1);
+    int yp1 = clampi(y + 1, 0, h - 1);
+
+    auto S = [&](int sx, int sy) -> unsigned short {
+        return wlww_to_u16(in[sy * w + sx], window, level);
+        };
+
+    unsigned short p00 = S(xm1, ym1);
+    unsigned short p10 = S(x, ym1);
+    unsigned short p20 = S(xp1, ym1);
+
+    unsigned short p01 = S(xm1, y);
+    unsigned short p21 = S(xp1, y);
+
+    unsigned short p02 = S(xm1, yp1);
+    unsigned short p12 = S(x, yp1);
+    unsigned short p22 = S(xp1, yp1);
+
+    int gx = -(int)p00 - 2 * (int)p01 - (int)p02 + (int)p20 + 2 * (int)p21 + (int)p22;
+    int gy = -(int)p00 - 2 * (int)p10 - (int)p20 + (int)p02 + 2 * (int)p12 + (int)p22;
+
+    float mag = sqrtf((float)(gx * gx + gy * gy));
+    mag = fminf(65535.0f, fmaxf(0.0f, mag));
+    out[y * w + x] = (unsigned short)(mag + 0.5f);
+}
+
+__global__ void BoxBlur3x3_Buf(const unsigned short* in, unsigned short* out, int w, int h)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    unsigned int sum = 0;
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        int sy = clampi(y + dy, 0, h - 1);
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            int sx = clampi(x + dx, 0, w - 1);
+            sum += (unsigned int)in[sy * w + sx];
+        }
+    }
+    out[y * w + x] = (unsigned short)((sum + 4) / 9);
+}
+
+__global__ void InvertU16_Buf(const unsigned short* in, unsigned short* out, int w, int h)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    unsigned short v = in[y * w + x];
+    out[y * w + x] = (unsigned short)(65535u - (unsigned int)v);
+}
+
+__global__ void ThresholdU16_Buf(const unsigned short* in, unsigned short* out, int w, int h, unsigned short th)
+{
+    int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (x >= w || y >= h) return;
+
+    unsigned short v = in[y * w + x];
+    out[y * w + x] = (v >= th) ? 65535 : 0;
+}
+
+
 // ============================================================
 // In-place processing entry (IO <-> MID), with cached MID
 // ============================================================
@@ -368,6 +526,97 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessArray_R16_Inplace(
             });
         if (e != cudaSuccess) return (int)e;
         // now curIsIO should be true
+    }
+
+    e = cudaDeviceSynchronize();
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CudaProcessBuffer_R16_Inplace(
+    void* ioDevPtrVoid,
+    int w,
+    int h,
+    int window,
+    int level,
+    int enableEdge,
+    int enableBlur,
+    int enableInvert,
+    int enableThreshold,
+    int thresholdValue)
+{
+    if (!ioDevPtrVoid) return (int)cudaErrorInvalidValue;
+    if (w <= 0 || h <= 0) return (int)cudaErrorInvalidValue;
+
+    unsigned short* io = (unsigned short*)ioDevPtrVoid;
+
+    cudaError_t e = EnsureMidBufferR16(w, h);
+    if (e != cudaSuccess) return (int)e;
+
+    dim3 block(16, 16);
+    dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+
+    // curIsIO==true => latest in io, false => in g_midBuf
+    bool curIsIO = true;
+
+    auto Src = [&]() -> const unsigned short* { return curIsIO ? io : g_midBuf; };
+    auto Dst = [&]() -> unsigned short* { return curIsIO ? g_midBuf : io; };
+
+    auto RunOp = [&](auto launcher) -> cudaError_t {
+        launcher(Src(), Dst());
+        cudaError_t ee = cudaGetLastError();
+        if (ee != cudaSuccess) return ee;
+        curIsIO = !curIsIO;
+        return cudaSuccess;
+        };
+
+    // Stage1: WLWW or Sobel (always)
+    e = RunOp([&](const unsigned short* in, unsigned short* out) {
+        if (enableEdge)
+            Sobel16Kernel_Buf << <grid, block >> > (in, out, w, h, window, level);
+        else
+            WLWW16Kernel_Buf << <grid, block >> > (in, out, w, h, window, level);
+        });
+    if (e != cudaSuccess) return (int)e;
+
+    // Stage2: blur
+    if (enableBlur)
+    {
+        e = RunOp([&](const unsigned short* in, unsigned short* out) {
+            BoxBlur3x3_Buf << <grid, block >> > (in, out, w, h);
+            });
+        if (e != cudaSuccess) return (int)e;
+    }
+
+    // Stage3: invert
+    if (enableInvert)
+    {
+        e = RunOp([&](const unsigned short* in, unsigned short* out) {
+            InvertU16_Buf << <grid, block >> > (in, out, w, h);
+            });
+        if (e != cudaSuccess) return (int)e;
+    }
+
+    // Stage4: threshold
+    if (enableThreshold)
+    {
+        int tv = thresholdValue;
+        if (tv < 0) tv = 0;
+        if (tv > 65535) tv = 65535;
+        unsigned short th = (unsigned short)tv;
+
+        e = RunOp([&](const unsigned short* in, unsigned short* out) {
+            ThresholdU16_Buf << <grid, block >> > (in, out, w, h, th);
+            });
+        if (e != cudaSuccess) return (int)e;
+    }
+
+    // Ensure final result is in IO
+    if (!curIsIO)
+    {
+        // latest is in mid -> copy back to io
+        size_t bytes = (size_t)w * (size_t)h * sizeof(unsigned short);
+        e = cudaMemcpy(io, g_midBuf, bytes, cudaMemcpyDeviceToDevice);
+        if (e != cudaSuccess) return (int)e;
     }
 
     e = cudaDeviceSynchronize();

@@ -14,13 +14,17 @@ static cudaGraphicsResource* g_cudaIO = nullptr;
 
 static ComPtr<ID3D11Device>        g_device;
 static ComPtr<ID3D11DeviceContext> g_context;
+
 static ComPtr<ID3D11Texture2D>     g_ioTex;
+static ComPtr<ID3D11Buffer>   g_ioBuf;
 
 static ComPtr<ID3D11Texture2D>     g_stagingUpload;
 static ComPtr<ID3D11Texture2D>     g_stagingReadback;
 
+static ComPtr<ID3D11Buffer> g_stagingUploadBuf;
+static ComPtr<ID3D11Buffer> g_stagingReadbackBuf;
+
 static ComPtr<ID3D11Texture2D>     g_ownedSharedTex;  // Createした実体（Init前）
-static HANDLE                      g_ownedHandle = nullptr;
 
 static std::atomic<bool> g_initialized{ false };
 static IPC_Params g_params{};
@@ -46,6 +50,33 @@ static HRESULT EnsureUploadStaging()
     return g_device->CreateTexture2D(&desc, nullptr, g_stagingUpload.GetAddressOf());
 }
 
+static HRESULT EnsureUploadStagingBuffer(int32_t requiredBytes)
+{
+    if (!g_device) return E_FAIL;
+    if (requiredBytes <= 0) return E_INVALIDARG;
+
+    if (g_stagingUploadBuf)
+    {
+        D3D11_BUFFER_DESC bd{};
+        g_stagingUploadBuf->GetDesc(&bd);
+        if ((int32_t)bd.ByteWidth >= requiredBytes)
+            return S_OK;
+
+        g_stagingUploadBuf.Reset();
+    }
+
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = (UINT)requiredBytes;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    desc.MiscFlags = 0;
+    desc.StructureByteStride = 0;
+
+    return g_device->CreateBuffer(&desc, nullptr, g_stagingUploadBuf.GetAddressOf());
+}
+
+
 static HRESULT EnsureReadbackStaging()
 {
     if (!g_ioTex || !g_device) return E_FAIL;
@@ -68,6 +99,32 @@ static HRESULT EnsureReadbackStaging()
     desc.MiscFlags = 0;
 
     return g_device->CreateTexture2D(&desc, nullptr, g_stagingReadback.GetAddressOf());
+}
+
+static HRESULT EnsureReadbackStagingBuffer(int32_t requiredBytes)
+{
+    if (!g_device) return E_FAIL;
+    if (requiredBytes <= 0) return E_INVALIDARG;
+
+    if (g_stagingReadbackBuf)
+    {
+        D3D11_BUFFER_DESC bd{};
+        g_stagingReadbackBuf->GetDesc(&bd);
+        if ((int32_t)bd.ByteWidth >= requiredBytes)
+            return S_OK;
+
+        g_stagingReadbackBuf.Reset();
+    }
+
+    D3D11_BUFFER_DESC desc{};
+    desc.ByteWidth = (UINT)requiredBytes;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    desc.MiscFlags = 0;
+    desc.StructureByteStride = 0;
+
+    return g_device->CreateBuffer(&desc, nullptr, g_stagingReadbackBuf.GetAddressOf());
 }
 
 
@@ -152,6 +209,59 @@ extern "C" {
         return IPC_OK;
     }
 
+    int32_t __cdecl IPC_InitWithIoBuffer(int32_t gpuId, void* ioBufferPtr)
+    {
+        if (!ioBufferPtr) return IPC_ERR_INVALIDARG;
+
+        // 既存リソース解放（g_cudaIO unregister / g_ioTex,g_ioBuf reset 等）
+        IPC_Shutdown();
+
+        // 受け取ったポインタは COM。IUnknown から ID3D11Buffer を取得して保持する。
+        IUnknown* unk = (IUnknown*)ioBufferPtr;
+
+        Microsoft::WRL::ComPtr<ID3D11Buffer> buf;
+        HRESULT hr = unk->QueryInterface(__uuidof(ID3D11Buffer), (void**)buf.GetAddressOf());
+        if (FAILED(hr)) return -201; // "not a buffer"
+
+        // このバッファを作ったデバイスを採用する（推奨：デバイスミスマッチ回避）
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        buf->GetDevice(dev.GetAddressOf());
+        if (!dev) return -202;
+
+        Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
+        dev->GetImmediateContext(ctx.GetAddressOf());
+        if (!ctx) return -203;
+
+        // 保存（Texture版は使わない）
+        g_device = dev;
+        g_context = ctx;
+        g_ioBuf = buf;
+        g_ioTex.Reset();
+
+        // Buffer descチェック（最低限）
+        D3D11_BUFFER_DESC bd{};
+        g_ioBuf->GetDesc(&bd);
+
+        // CUDAから書き込みたいなら UAV を要求するのが無難
+        if ((bd.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
+            return -204;
+
+        // CUDA device select（従来どおり）
+        int cr = CudaSetDeviceSafe((int)gpuId);
+        if (cr != 0) return -1000 - cr;
+
+        // CUDA登録：Textureではなく Buffer を登録する
+        // ここはあなたの CudaRegisterD3D11Texture の “Buffer版” を用意するのが一番きれい
+        // 直接書くなら cudaGraphicsD3D11RegisterResource
+        cr = CudaRegisterD3D11Buffer(g_ioBuf.Get(), &g_cudaIO);
+        if (cr != 0) return -1200 - cr;
+
+
+        g_initialized.store(true);
+        return 0;
+    }
+
+
     int32_t __cdecl IPC_SetParams(const IPC_Params* p)
     {
         int32_t v = ValidateParams(p);
@@ -160,17 +270,51 @@ extern "C" {
 
         std::lock_guard<std::mutex> lk(g_mtx);
         g_params = *p;
+        g_w = p->width;
+        g_h = p->height;
         return IPC_OK;
     }
+
+    //int32_t __cdecl IPC_Execute()
+    //{
+    //    if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+    //    if (!g_cudaIO) return IPC_ERR_NOT_INITIALIZED;
+
+    //    void* ioArr = nullptr;
+    //    int cr = CudaMapGetArrayMapped(g_cudaIO, &ioArr);
+    //    if (cr != 0) return -1300 - cr;
+
+    //    IPC_Params p;
+    //    {
+    //        std::lock_guard<std::mutex> lk(g_mtx);
+    //        p = g_params;
+    //    }
+
+    //    int enableBlur = p.reserved[0];
+    //    int enableInvert = p.reserved[1];
+    //    int enableThreshold = p.reserved[2];
+    //    int thresholdValue = p.reserved[3];
+
+    //    cr = CudaProcessArray_R16_Inplace(
+    //        ioArr, g_w, g_h,
+    //        p.window, p.level,
+    //        p.enableEdge,
+    //        enableBlur,
+    //        enableInvert,
+    //        enableThreshold,
+    //        thresholdValue);
+
+    //    int cr2 = CudaUnmapResource(g_cudaIO);
+
+    //    if (cr != 0) return -1400 - cr;
+    //    if (cr2 != 0) return -1500 - cr2;
+    //    return IPC_OK;
+    //}
 
     int32_t __cdecl IPC_Execute()
     {
         if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
         if (!g_cudaIO) return IPC_ERR_NOT_INITIALIZED;
-
-        void* ioArr = nullptr;
-        int cr = CudaMapGetArrayMapped(g_cudaIO, &ioArr);
-        if (cr != 0) return -1300 - cr;
 
         IPC_Params p;
         {
@@ -183,21 +327,68 @@ extern "C" {
         int enableThreshold = p.reserved[2];
         int thresholdValue = p.reserved[3];
 
-        cr = CudaProcessArray_R16_Inplace(
-            ioArr, g_w, g_h,
-            p.window, p.level,
-            p.enableEdge,
-            enableBlur,
-            enableInvert,
-            enableThreshold,
-            thresholdValue);
+        int cr = 0;
+        int cr2 = 0;
 
-        int cr2 = CudaUnmapResource(g_cudaIO);
+        // --- Texture path (legacy) ---
+        if (g_ioTex)
+        {
+            void* ioArr = nullptr;
+            cr = CudaMapGetArrayMapped(g_cudaIO, &ioArr);
+            if (cr != 0) return -1300 - cr;
 
-        if (cr != 0) return -1400 - cr;
-        if (cr2 != 0) return -1500 - cr2;
-        return IPC_OK;
+            cr = CudaProcessArray_R16_Inplace(
+                ioArr, g_w, g_h,
+                p.window, p.level,
+                p.enableEdge,
+                enableBlur,
+                enableInvert,
+                enableThreshold,
+                thresholdValue);
+
+            cr2 = CudaUnmapResource(g_cudaIO);
+
+            if (cr != 0) return -1400 - cr;
+            if (cr2 != 0) return -1500 - cr2;
+            return IPC_OK;
+        }
+
+        // --- Buffer path (new) ---
+        if (g_ioBuf)
+        {
+            void* devPtr = nullptr;
+            size_t mappedBytes = 0;
+
+            cr = CudaMapGetPointerMapped(g_cudaIO, &devPtr, &mappedBytes);
+            if (cr != 0) return -1310 - cr;
+
+            // mappedBytes sanity (optional)
+            const size_t required = (size_t)g_w * (size_t)g_h * 2u;
+            if (mappedBytes < required)
+            {
+                CudaUnmapResource(g_cudaIO);
+                return IPC_ERR_INVALID_STATE;
+            }
+
+            cr = CudaProcessBuffer_R16_Inplace(
+                devPtr, g_w, g_h,
+                p.window, p.level,
+                p.enableEdge,
+                enableBlur,
+                enableInvert,
+                enableThreshold,
+                thresholdValue);
+
+            cr2 = CudaUnmapResource(g_cudaIO);
+
+            if (cr != 0) return -1410 - cr;
+            if (cr2 != 0) return -1510 - cr2;
+            return IPC_OK;
+        }
+
+        return IPC_ERR_NOT_INITIALIZED;
     }
+
 
     int32_t __cdecl IPC_Shutdown()
     {
@@ -209,7 +400,11 @@ extern "C" {
 
         g_stagingUpload.Reset();
         g_stagingReadback.Reset();
+        g_stagingUploadBuf.Reset();
+        g_stagingReadbackBuf.Reset();
+
         g_ioTex.Reset();
+        g_ioBuf.Reset();
 
         g_context.Reset();
         g_device.Reset();
@@ -254,6 +449,42 @@ extern "C" {
         return IPC_OK;
     }
 
+    int32_t __cdecl IPC_UploadRaw16ToBuffer(const void* src, int32_t srcBytes, int32_t width, int32_t height)
+    {
+        g_w = width;
+        g_h = height;
+        if (!src) return IPC_ERR_INVALID_ARG;
+        if (!g_device || !g_context || !g_ioBuf) return IPC_ERR_NOT_INITIALIZED;
+        if (g_w <= 0 || g_h <= 0) return IPC_ERR_INVALID_STATE;
+
+        const int32_t required = g_w * g_h * 2;
+        if (srcBytes < required) return IPC_ERR_INVALID_ARG;
+
+        // IOバッファ容量チェック（安全）
+        D3D11_BUFFER_DESC ioDesc{};
+        g_ioBuf->GetDesc(&ioDesc);
+        if ((int32_t)ioDesc.ByteWidth < required)
+            return IPC_ERR_INVALID_STATE; // IOバッファが小さすぎる
+
+        HRESULT hr = EnsureUploadStagingBuffer(required);
+        if (FAILED(hr) || !g_stagingUploadBuf) return IPC_ERR_INTERNAL;
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = g_context->Map(g_stagingUploadBuf.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
+        if (FAILED(hr) || !mapped.pData) return IPC_ERR_INTERNAL;
+
+        // Bufferは線形なので一発コピーでOK（RowPitchは使わない）
+        memcpy(mapped.pData, src, required);
+
+        g_context->Unmap(g_stagingUploadBuf.Get(), 0);
+
+        // staging -> IO（Buffer）
+        g_context->CopyResource(g_ioBuf.Get(), g_stagingUploadBuf.Get());
+
+        return IPC_OK;
+    }
+
+
     
     int32_t __cdecl IPC_ReadbackRaw16(void* dst, int32_t dstBytes)
     {
@@ -290,6 +521,40 @@ extern "C" {
         return IPC_OK;
     }
 
+    int32_t __cdecl IPC_ReadbackRaw16FromBuffer(void* dst, int32_t dstBytes)
+    {
+        if (!dst) return IPC_ERR_INVALID_ARG;
+        if (!g_device || !g_context || !g_ioBuf) return IPC_ERR_NOT_INITIALIZED;
+        if (g_w <= 0 || g_h <= 0) return IPC_ERR_INVALID_STATE;
+
+        const int32_t required = g_w * g_h * 2;
+        if (dstBytes < required) return IPC_ERR_INVALID_ARG;
+
+        // IOバッファ容量チェック（安全）
+        D3D11_BUFFER_DESC ioDesc{};
+        g_ioBuf->GetDesc(&ioDesc);
+        if ((int32_t)ioDesc.ByteWidth < required)
+            return IPC_ERR_INVALID_STATE;
+
+        HRESULT hr = EnsureReadbackStagingBuffer(required);
+        if (FAILED(hr) || !g_stagingReadbackBuf) return IPC_ERR_INTERNAL;
+
+        // IO -> staging
+        g_context->CopyResource(g_stagingReadbackBuf.Get(), g_ioBuf.Get());
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        hr = g_context->Map(g_stagingReadbackBuf.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr) || !mapped.pData) return IPC_ERR_INTERNAL;
+
+        // Bufferは線形なので一発コピー
+        memcpy(dst, mapped.pData, required);
+
+        g_context->Unmap(g_stagingReadbackBuf.Get(), 0);
+
+        return IPC_OK;
+    }
+
+
 
     static int32_t CreateDeviceForGpu(int32_t gpuId, ID3D11Device** dev, ID3D11DeviceContext** ctx)
     {
@@ -319,19 +584,13 @@ extern "C" {
         if (FAILED(hr)) return -3;
         return 0;
     }
-    // 失敗原因をC#へ返すため（後述のGetLastHr/GetLastErr用）
+
     static HRESULT g_lastHr = S_OK;
     static const char* g_lastErr = "OK";
     static void SetErr(HRESULT hr, const char* msg) { g_lastHr = hr; g_lastErr = msg; }
     IPC_API void* __cdecl IPC_CreateIoSharedHandle(int32_t gpuId, int32_t width, int32_t height)
     {
         // 既存破棄（Destroyと同様、所有しているものだけ）
-        if (g_ownedHandle)
-        {
-            HANDLE old = g_ownedHandle;
-            g_ownedHandle = nullptr;
-            CloseHandle(old);
-        }
         g_ownedSharedTex.Reset();
 
         // ★ ここは IPC_Init と同じ関数を使う（すでに上にある）
@@ -367,18 +626,94 @@ extern "C" {
         hr = res->GetSharedHandle(&h);
         if (FAILED(hr) || !h) return nullptr;
 
-        g_ownedHandle = h;
-        return (void*)g_ownedHandle;
+        return (void*)h;
     }
 
 
     IPC_API void __cdecl IPC_DestroyIoSharedHandle(void* sharedHandle)
     {
-        if ((HANDLE)sharedHandle == g_ownedHandle)
-        {
-            g_ownedHandle = nullptr;
-        }
+        sharedHandle = nullptr;
     }
 
 
+    IPC_API void* __cdecl IPC_CreateIoBuffer(int32_t gpuId, int32_t width, int32_t height)
+    {
+        g_lastHr = S_OK;
+        g_lastErr = "OK";
+
+        if (width <= 0 || height <= 0)
+        {
+            SetErr(E_INVALIDARG, "Invalid width/height");
+            return nullptr;
+        }
+
+        // ここは IPC_Init と同じデバイス生成ロジックを使うのが重要
+        ComPtr<ID3D11Device> dev;
+        ComPtr<ID3D11DeviceContext> ctx;
+        HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, dev.GetAddressOf(), ctx.GetAddressOf());
+        if (FAILED(hr))
+        {
+            SetErr(hr, "CreateDeviceOnAdapterIndex failed");
+            return nullptr;
+        }
+
+        // 例：R16画像を想定（必要ならBgra32等に合わせて変更）
+        const uint64_t bytes = (uint64_t)width * (uint64_t)height * 2ULL;
+        if (bytes == 0 || bytes > (uint64_t)UINT32_MAX)
+        {
+            SetErr(E_INVALIDARG, "Buffer size overflow");
+            return nullptr;
+        }
+
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = (UINT)bytes;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+        // Raw UAV/SRVを作りやすくする（CUDA登録側でも扱いやすいことが多い）
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+
+        // Raw viewの要件：ByteWidth が 4の倍数推奨
+        // R16画像(2bytes)だと (w*h*2) が 4の倍数にならない可能性があるので、
+        // 必要なら 4バイト境界に丸める（API要件次第で選択）
+        // ここでは安全側で丸める例：
+        if ((bd.ByteWidth & 3u) != 0)
+        {
+            bd.ByteWidth = (bd.ByteWidth + 3u) & ~3u;
+        }
+
+        ComPtr<ID3D11Buffer> buf;
+        hr = dev->CreateBuffer(&bd, nullptr, buf.GetAddressOf());
+        if (FAILED(hr))
+        {
+            SetErr(hr, "CreateBuffer failed");
+            return nullptr;
+        }
+
+        // ★DLL境界で返すので AddRef して “受け取り側の参照” を作る
+        // ComPtrの所有とは別に、返したポインタを受け取り側が保持してよいようにする
+        ID3D11Buffer* raw = buf.Get();
+        raw->AddRef();
+
+        // この関数内の ComPtr はスコープアウトで Release されるが、
+        // AddRef 済みなので返した参照は有効に残る
+        return (void*)raw;
+    }
+
+    IPC_API void __cdecl IPC_ReleaseD3D11Resource(void* d3d11Resource)
+    {
+        // 受け取った側が最後に呼ぶ。AddRefした分をReleaseして寿命を正しく閉じる。
+        IUnknown* unk = (IUnknown*)d3d11Resource;
+        if (unk) unk->Release();
+    }
+
+    IPC_API int32_t __cdecl IPC_GetLastHr()
+    {
+        return (int32_t)g_lastHr;
+    }
+
+    IPC_API const char* __cdecl IPC_GetLastErr()
+    {
+        return g_lastErr;
+    }
 } // extern "C"

@@ -15,6 +15,13 @@ namespace RawDxPlayerWpf.Processing
             _initialized = true;
         }
 
+        public void InitializeWithIoBuffer(int gpuId, IntPtr inoutDxSharedBuffer)
+        {
+            int r = NativeImageProc.IPC_InitWithIoBuffer(gpuId, inoutDxSharedBuffer);
+            if (r != 0) throw new InvalidOperationException($"IPC_Init failed: {r}");
+            _initialized = true;
+        }
+
         public void SetParameters(object paramStruct)
         {
             if (!_initialized) return;
@@ -55,7 +62,8 @@ namespace RawDxPlayerWpf.Processing
             {
                 hnd = GCHandle.Alloc(raw16, GCHandleType.Pinned);
                 IntPtr p = hnd.AddrOfPinnedObject();
-                int r = NativeImageProc.IPC_UploadRaw16(p, bytes);
+                //int r = NativeImageProc.IPC_UploadRaw16(p, bytes);
+                int r = NativeImageProc.IPC_UploadRaw16ToBuffer(p, bytes, w, h);
                 if (r != 0) throw new InvalidOperationException($"IPC_UploadRaw16 failed: {r}");
             }
             finally
@@ -76,7 +84,8 @@ namespace RawDxPlayerWpf.Processing
             {
                 h = GCHandle.Alloc(managed, GCHandleType.Pinned);
                 IntPtr p = h.AddrOfPinnedObject();
-                int r = NativeImageProc.IPC_ReadbackRaw16(p, bytes);
+                //int r = NativeImageProc.IPC_ReadbackRaw16(p, bytes);
+                int r = NativeImageProc.IPC_ReadbackRaw16FromBuffer(p, bytes);
                 if (r != 0) throw new InvalidOperationException($"IPC_ReadbackRaw16 failed: {r}");
                 return managed;
             }

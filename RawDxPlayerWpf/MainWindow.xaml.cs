@@ -40,6 +40,8 @@ namespace RawDxPlayerWpf
         private string _outputDir;
 
         private IntPtr _ioSharedHandle = IntPtr.Zero;
+        private IntPtr _ioBuffer = IntPtr.Zero;
+
         public MainWindow()
         {
             InitializeComponent();
@@ -76,6 +78,13 @@ namespace RawDxPlayerWpf
             _ioSharedHandle = IntPtr.Zero;
             if (h != IntPtr.Zero)
                 NativeImageProc.IPC_DestroyIoSharedHandle(h);
+
+            var old = _ioBuffer;
+            _ioBuffer = IntPtr.Zero;
+            if (old != IntPtr.Zero)
+            {
+                NativeImageProc.IPC_ReleaseD3D11Resource(old);
+            }
         }
 
         private void BtnOpen_Click(object sender, RoutedEventArgs e)
@@ -116,6 +125,36 @@ namespace RawDxPlayerWpf
                 throw new InvalidOperationException("IPC_CreateIoSharedHandle failed.");
             }
 
+            // 既存の IO buffer があれば Release
+            var old = _ioBuffer;
+            _ioBuffer = IntPtr.Zero;
+            if (old != IntPtr.Zero)
+            {
+                NativeImageProc.IPC_ReleaseD3D11Resource(old);
+            }
+
+            // C++側で IO buffer（ID3D11Buffer*）を生成
+            _ioBuffer = NativeImageProc.IPC_CreateIoBuffer(
+                gpuId: gpuId,
+                width: _seq.Width,
+                height: _seq.Height);
+
+            if (_ioBuffer == IntPtr.Zero)
+            {
+                // 可能なら原因も出す
+                int hr = 0;
+                string msg = "";
+                try
+                {
+                    hr = NativeImageProc.IPC_GetLastHr();
+                    var p = NativeImageProc.IPC_GetLastErr();
+                    msg = p == IntPtr.Zero ? "" : (System.Runtime.InteropServices.Marshal.PtrToStringAnsi(p) ?? "");
+                }
+                catch { /* optional */ }
+
+                throw new InvalidOperationException($"IPC_CreateIoBuffer failed. hr=0x{hr:X8} {msg}");
+            }
+
 
             _wb = new WriteableBitmap(_seq.Width, _seq.Height, 96, 96,
                 PixelFormats.Bgra32, null);
@@ -124,7 +163,8 @@ namespace RawDxPlayerWpf
             // init dll (single IO handle)
             try
             {
-                _processor.Initialize(gpuId, _ioSharedHandle);
+                //_processor.Initialize(gpuId, _ioSharedHandle);
+                _processor.InitializeWithIoBuffer(gpuId, _ioBuffer);
                 _dllInitialized = true;
                 ApplyParamsToDll();
             }
@@ -398,6 +438,7 @@ namespace RawDxPlayerWpf
             try
             {
                 var p = NativeImageProc.MakeDefaultParams(
+                    width: _seq.Width, height: _seq.Height,
                     window: _window, level: _level,
                     enableEdge: _enableEdge,
                     enableBlur: _enableBlur,
