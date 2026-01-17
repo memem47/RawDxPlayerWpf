@@ -1,0 +1,7 @@
+name,input,width,height,window,level,enable_edge,enable_blur,enable_invert,enable_threshold,threshold_value,golden,metric,pass_value,note
+wlww_basic,tests/input/frame_0000.raw,512,512,3000,1500,0,0,0,0,0,tests/golden/frame_0000.raw,mae,0.5,WLWW only
+sobel_only,tests/input/frame_0001.raw,512,512,3000,1500,1,0,0,0,0,tests/golden/frame_0001.raw,mae,1.2,Sobel edge
+blur_only,tests/input/frame_0002.raw,512,512,3000,1500,0,1,0,0,0,tests/golden/frame_0002.raw,mae,0.8,3x3 blur
+invert_only,tests/input/frame_0003.raw,512,512,3000,1500,0,0,1,0,0,tests/golden/frame_0003.raw,exact,0,Invert should be exact
+threshold_only,tests/input/frame_0004.raw,512,512,1,0,0,0,0,1,20000,tests/golden/frame_0004.raw,exact,0,Threshold should be exact
+full_pipeline,tests/input/frame_0005.raw,512,512,3000,1500,1,1,1,1,18000,tests/golden/frame_0005.raw,psnr,40,All effects enabled
