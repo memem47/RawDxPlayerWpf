@@ -36,33 +36,54 @@ static cudaError_t EnsureMidArrayR16(int w, int h)
     return cudaSuccess;
 }
 
+//------------------------------------------------------------------------------ 
+// グローバル中間バッファ（16bit R チャンネル用） 
+//------------------------------------------------------------------------------ 
+// GPU 上に確保する 16bit 中間バッファ
 static unsigned short* g_midBuf = nullptr;
+// 現在確保されているバッファの幅・高さ
 static int g_midW2 = 0;
 static int g_midH2 = 0;
 
+//------------------------------------------------------------------------------
+// EnsureMidBufferR16 
+// 指定されたサイズ (w x h) の 16bit 中間バッファが GPU 上に存在することを保証する。 
+// 既存バッファが同サイズであれば再確保は行わない。 
+// サイズが異なる場合は既存バッファを解放し、新たに確保する。 
+// 戻り値: 
+//   cudaSuccess 正常終了 
+//   その他の値 CUDA API からのエラーコード
+// ------------------------------------------------------------------------------
 static cudaError_t EnsureMidBufferR16(int w, int h)
 {
+    // 既存バッファが要求サイズと一致していれば何もしない
     if (g_midBuf && g_midW2 == w && g_midH2 == h) return cudaSuccess;
 
+    // サイズ不一致または未確保の場合、既存バッファを解放
     if (g_midBuf)
     {
         cudaError_t e0 = cudaFree(g_midBuf);
         g_midBuf = nullptr;
         g_midW2 = g_midH2 = 0;
+        // 解放に失敗した場合は即座にエラーを返す
         if (e0 != cudaSuccess) return e0;
     }
 
+    // 新しいバッファを確保
     size_t bytes = (size_t)w * (size_t)h * sizeof(unsigned short);
     cudaError_t e = cudaMalloc((void**)&g_midBuf, bytes);
     if (e != cudaSuccess)
     {
+        // 確保失敗時は状態をクリアしてエラーを返す
         g_midBuf = nullptr;
         g_midW2 = g_midH2 = 0;
         return e;
     }
 
+    // 正常に確保できたのでサイズ情報を更新
     g_midW2 = w;
     g_midH2 = h;
+
     return cudaSuccess;
 }
 
@@ -532,6 +553,23 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessArray_R16_Inplace(
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
+//------------------------------------------------------------------------------ 
+// CudaProcessBuffer_R16_Inplace 
+// 16bit グレースケール画像バッファ（GPU メモリ上）に対して、指定された 
+// 一連の画像処理（WL/WW、Sobel、Blur、Invert、Threshold）をインプレースで実行する。 
+// 引数: 
+//   ioDevPtrVoid : GPU 上の入力兼出力バッファ（unsigned short*） 
+//   w, h : 画像サイズ（幅・高さ） 
+//   window, level : WL/WW または Sobel 用パラメータ 
+//   enableEdge : Sobel エッジ検出を有効化（false の場合は WL/WW） 
+//   enableBlur : 3x3 ボックスブラーを有効化 
+//   enableInvert : 階調反転を有効化
+//   enableThreshold: 二値化処理を有効化
+//   thresholdValue : 二値化の閾値（0-65535）
+// 戻り値: 
+//   0 : 正常終了
+//  その他 : CUDA エラーコード 
+// ------------------------------------------------------------------------------
 extern "C" __declspec(dllexport) int __cdecl CudaProcessBuffer_R16_Inplace(
     void* ioDevPtrVoid,
     int w,
@@ -544,23 +582,30 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessBuffer_R16_Inplace(
     int enableThreshold,
     int thresholdValue)
 {
+    // 入力ポインタと画像サイズの妥当性チェック
     if (!ioDevPtrVoid) return (int)cudaErrorInvalidValue;
     if (w <= 0 || h <= 0) return (int)cudaErrorInvalidValue;
 
+    // 入出力バッファ（GPU メモリ）
     unsigned short* io = (unsigned short*)ioDevPtrVoid;
 
+    // 中間バッファの確保（必要に応じて再確保）
     cudaError_t e = EnsureMidBufferR16(w, h);
     if (e != cudaSuccess) return (int)e;
 
+    // CUDA カーネルの実行構成
     dim3 block(16, 16);
     dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
 
-    // curIsIO==true => latest in io, false => in g_midBuf
+    // curIsIO == true : 最新データが io にある 
+    // curIsIO == false: 最新データが g_midBuf にある
     bool curIsIO = true;
 
+    // 入力元と出力先を動的に切り替えるラムダ
     auto Src = [&]() -> const unsigned short* { return curIsIO ? io : g_midBuf; };
     auto Dst = [&]() -> unsigned short* { return curIsIO ? g_midBuf : io; };
 
+    // カーネル実行 → エラーチェック → バッファ切り替え を共通化
     auto RunOp = [&](auto launcher) -> cudaError_t {
         launcher(Src(), Dst());
         cudaError_t ee = cudaGetLastError();
@@ -610,15 +655,16 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessBuffer_R16_Inplace(
         if (e != cudaSuccess) return (int)e;
     }
 
-    // Ensure final result is in IO
+    // 最終結果が io にあることを保証
     if (!curIsIO)
     {
-        // latest is in mid -> copy back to io
+        // 最新データが g_midBuf にあるため io にコピーする
         size_t bytes = (size_t)w * (size_t)h * sizeof(unsigned short);
         e = cudaMemcpy(io, g_midBuf, bytes, cudaMemcpyDeviceToDevice);
         if (e != cudaSuccess) return (int)e;
     }
 
+    // 全カーネルの完了を同期
     e = cudaDeviceSynchronize();
     return (e == cudaSuccess) ? 0 : (int)e;
 }
