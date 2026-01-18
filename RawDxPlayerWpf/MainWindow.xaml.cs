@@ -202,19 +202,54 @@ namespace RawDxPlayerWpf
         }
 
         /// <summary>
-        /// Pipeline (single IO texture, true 16-bit):
-        /// 1) Load RAW16 -> Upload to IO (R16)
-        /// 2) If DLL ON: in-place processing IO->IO using intermediate arrays in CUDA
-        /// 3) Readback IO RAW16 -> CPU WL/WW -> BGRA8 -> display
-        /// 4) Optional export (RAW16 + PNG)
+        /// Render and display the next frame in the sequence using a GPU-accelerated pipeline.
+        ///
+        /// Pipeline overview (single IO texture, true 16-bit precision):
+        ///   1) Load RAW16 image from disk and upload it to the shared IO resource (DXGI_FORMAT_R16_UINT).
+        ///   2) If the native DLL processing is enabled:
+        ///        - Apply current processing parameters.
+        ///        - Execute in-place CUDA processing (IO -> IO) using intermediate device buffers.
+        ///   3) Read back the processed RAW16 image from the IO resource to CPU memory.
+        ///        - CPU-side Window/Level (WL/WW) is applied for display.
+        ///        - Converted to BGRA8 for WPF rendering.
+        ///   4) Optionally export the frame (RAW16 and/or PNG).
+        ///
+        /// Threading / safety assumptions:
+        ///   - This method is called from the UI thread (DispatcherTimer).
+        ///   - All GPU/D3D/CUDA operations are internally serialized and executed on a
+        ///     dedicated GPU worker thread inside the native DLL.
+        ///   - This method itself performs no explicit locking.
+        ///
+        /// Performance characteristics:
+        ///   - Disk I/O, GPU processing, GPU->CPU readback, and display conversion times
+        ///     are individually measured for diagnostics.
+        ///   - GPU readback is performed inside the native DLL to avoid redundant
+        ///     DX-side copies in managed code.
+        ///
+        /// Notes:
+        ///   - The IO resource always remains in 16-bit (RAW16) format; no quantization
+        ///     is introduced on the GPU side.
+        ///   - Display WL/WW is intentionally performed on CPU to keep GPU processing
+        ///     independent of visualization logic.
         /// </summary>
+        /// <param name="forceSameIndex">
+        /// If true, re-renders the current frame index without advancing the sequence.
+        /// Used for parameter updates (WL/WW, filters) where reloading the frame is unnecessary.
+        /// </param>
         private void RenderNextFrame(bool forceSameIndex = false)
         {
+            // Guard conditions:
+            // - No active sequence loaded
+            // - Native DLL not initialized (GPU/D3D/CUDA resources unavailable)
             if (_seq == null || !_dllInitialized) return;
 
+            // Measure total frame processing time (end-to-end)
             var swTotal = Stopwatch.StartNew();
+
+            // Per-stage timing (milliseconds)
             long tLoadUp = 0, tCuda = 0, tRead = 0, tDisp = 0;
 
+            // Advance frame index unless explicitly re-rendering the same frame
             if (!forceSameIndex)
             {
                 _index++;
@@ -223,60 +258,125 @@ namespace RawDxPlayerWpf
 
             string path = _seq.Files[_index];
 
-            // ① RAW16 -> IO upload
+            // ---------------------------------------------------------------------
+            // ① RAW16 load from disk and upload to GPU IO resource
+            // ---------------------------------------------------------------------
+            // This stage includes:
+            //   - File I/O (RAW16 read)
+            //   - CPU memory allocation
+            //   - Upload to the shared GPU IO texture/buffer
+            //
+            // Upload is delegated to the native DLL to ensure that all D3D/CUDA
+            // interactions occur on the GPU worker thread.
             var sw = Stopwatch.StartNew();
-            
-            byte[] raw16In = RawFrameReader.Load16RawBytes(path, _seq.Width, _seq.Height);
-            //_renderer.UploadIoRaw16(raw16In);
-            (_processor as NativeImageProcessor)?.UploadRaw16(raw16In, _seq.Width, _seq.Height);
+
+            byte[] raw16In = RawFrameReader.Load16RawBytes(
+                path, _seq.Width, _seq.Height);
+
+            (_processor as NativeImageProcessor)?.UploadRaw16(
+                raw16In, _seq.Width, _seq.Height);
+
             sw.Stop();
             tLoadUp = sw.ElapsedMilliseconds;
 
-            // ② in-place processing (optional)
+            // ---------------------------------------------------------------------
+            // ② In-place GPU processing (optional)
+            // ---------------------------------------------------------------------
+            // When enabled, the native DLL performs CUDA-based processing directly
+            // on the IO resource (IO -> IO), preserving full 16-bit precision.
+            //
+            // Processing parameters are snapshotted inside the DLL to ensure
+            // deterministic execution even if UI parameters change mid-frame.
             bool dllOn = (CbDllOn.IsChecked == true);
             if (dllOn && _dllInitialized)
             {
                 ApplyParamsToDll();
+
                 sw.Restart();
                 _processor.Execute();
                 sw.Stop();
+
                 tCuda = sw.ElapsedMilliseconds;
             }
 
-            // ③ IO readback -> display conversion
+            // ---------------------------------------------------------------------
+            // ③ GPU -> CPU readback and display preparation
+            // ---------------------------------------------------------------------
+            // The processed RAW16 image is read back from the IO resource.
+            // Readback is implemented in native code to:
+            //   - Avoid redundant DX-side copies
+            //   - Keep all GPU synchronization localized to the native layer
             sw.Restart();
-            // ③ 出力(raw16)を readback して、CPUでWL/WWし表示
-            //byte[] raw16Out = _renderer.ReadbackOutputRaw16();
 
-            // GPU->CPU readback is done in native (ImageProcApi.cpp) to avoid DxRenderer-side copy
-            byte[] raw16Out = (_processor as NativeImageProcessor)?.ReadbackRaw16(_seq.Width, _seq.Height);
+            byte[] raw16Out = (_processor as NativeImageProcessor)
+                ?.ReadbackRaw16(_seq.Width, _seq.Height);
+
             sw.Stop();
             tRead = sw.ElapsedMilliseconds;
-    
-            // ---- Display WL/WW ----
-            // Edge出力は輝度分布が変わるので、表示用WL/WWは自動推定する
+
+            // ---------------------------------------------------------------------
+            // Display WL/WW (CPU-side)
+            // ---------------------------------------------------------------------
+            // Display window/level is decoupled from GPU processing:
+            //   - Keeps CUDA kernels independent of visualization logic
+            //   - Allows fast experimentation with display parameters
+            //
+            // Edge-detection output significantly alters intensity distribution,
+            // so WL/WW is automatically estimated in that case.
             int dispWindow = _window;
-            int dispLevel  = _level;
+            int dispLevel = _level;
+
             if (_enableEdge != 0)
             {
-                GetAutoWindowLevelFromRaw16(raw16Out, out dispWindow, out dispLevel);
+                GetAutoWindowLevelFromRaw16(
+                    raw16Out, out dispWindow, out dispLevel);
             }
-    
-            sw.Restart();
-            byte[] bgra = RawFrameReader.Convert16ToBgra8(raw16Out, _seq.Width, _seq.Height, dispWindow, dispLevel);
 
-            _wb.WritePixels(new Int32Rect(0, 0, _seq.Width, _seq.Height), bgra, _seq.Width * 4, 0);
+            sw.Restart();
+
+            byte[] bgra = RawFrameReader.Convert16ToBgra8(
+                raw16Out,
+                _seq.Width,
+                _seq.Height,
+                dispWindow,
+                dispLevel);
+
+            // Update WPF WriteableBitmap in-place
+            _wb.WritePixels(
+                new Int32Rect(0, 0, _seq.Width, _seq.Height),
+                bgra,
+                _seq.Width * 4,
+                0);
+
             sw.Stop();
             tDisp = sw.ElapsedMilliseconds;
 
+            // ---------------------------------------------------------------------
+            // Status / diagnostics
+            // ---------------------------------------------------------------------
             swTotal.Stop();
-            TbStatus.Text =
-            $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}" +
-            $" | Load+Up {tLoadUp}ms | CUDA {tCuda}ms | Read {tRead}ms | Disp {tDisp}ms | Total {swTotal.ElapsedMilliseconds}ms";
 
-            // ④ export
-            SaveFrameIfEnabled(raw16Out, bgra, _seq.Width, _seq.Height, _index);
+            TbStatus.Text =
+                $"Frame {_index + 1}/{_seq.Files.Count} : {System.IO.Path.GetFileName(path)}" +
+                $" | Load+Up {tLoadUp}ms" +
+                $" | CUDA {tCuda}ms" +
+                $" | Read {tRead}ms" +
+                $" | Disp {tDisp}ms" +
+                $" | Total {swTotal.ElapsedMilliseconds}ms";
+
+            // ---------------------------------------------------------------------
+            // ④ Optional export
+            // ---------------------------------------------------------------------
+            // Exports are intentionally performed after display update so that
+            // visualization latency is not affected by file I/O.
+            SaveFrameIfEnabled(
+                raw16Out,
+                bgra,
+                _seq.Width,
+                _seq.Height,
+                _index);
         }
+
 
         // Edge表示用：RAW16のmin/maxからwindow/levelを推定
         private static void GetAutoWindowLevelFromRaw16(byte[] raw16LittleEndian, out int window, out int level)

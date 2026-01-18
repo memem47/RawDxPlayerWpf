@@ -8,7 +8,81 @@
 #include <atomic>
 #include <mutex>
 
+#include <thread>
+#include <condition_variable>
+#include <queue>
+#include <future>
+#include <functional>
+
 using Microsoft::WRL::ComPtr;
+
+// ------------------------------
+// GPU Worker (single-thread executor)
+// ------------------------------
+class GpuWorker
+{
+public:
+    void Start()
+    {
+        std::lock_guard<std::mutex> lk(m_);
+        if (running_) return;
+        stop_ = false;
+        th_ = std::thread([this] { Run(); });
+        running_ = true;
+    }
+
+    void Stop()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            if (!running_) return;
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (th_.joinable()) th_.join();
+        running_ = false;
+    }
+
+    int32_t SubmitAndWait(std::function<int32_t()> fn)
+    {
+        Start();
+        std::packaged_task<int32_t()> task(std::move(fn));
+        auto fut = task.get_future();
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            q_.push(std::move(task));
+        }
+        cv_.notify_one();
+        return fut.get();
+    }
+
+private:
+    void Run()
+    {
+        while (true)
+        {
+            std::packaged_task<int32_t()> task;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
+                if (stop_ && q_.empty()) break;
+                task = std::move(q_.front());
+                q_.pop();
+            }
+            task(); // execute job
+        }
+    }
+
+    std::thread th_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::queue<std::packaged_task<int32_t()>> q_;
+    bool stop_ = false;
+    bool running_ = false;
+};
+
+static GpuWorker g_worker;
+
 
 static cudaGraphicsResource* g_cudaIO = nullptr;
 
@@ -162,117 +236,234 @@ static HRESULT CreateDeviceOnAdapterIndex(int gpuId, ID3D11Device** dev, ID3D11D
     );
 }
 
+static int32_t Shutdown_Impl()
+{
+    g_initialized.store(false);
+
+    if (g_cudaIO) { CudaUnregister(g_cudaIO); g_cudaIO = nullptr; }
+
+    CudaReleaseCache();
+
+    g_stagingUpload.Reset();
+    g_stagingReadback.Reset();
+    g_stagingUploadBuf.Reset();
+    g_stagingReadbackBuf.Reset();
+
+    g_ioTex.Reset();
+    g_ioBuf.Reset();
+
+    g_context.Reset();
+    g_device.Reset();
+
+    g_w = 0;
+    g_h = 0;
+
+    return IPC_OK;
+}
+
+static int32_t InitWithSharedHandle_Impl(int32_t gpuId, void* ioSharedHandle)
+{
+    if (!ioSharedHandle) return IPC_ERR_INVALIDARG;
+
+    // 旧リソースをワーカースレッド内で解放
+    Shutdown_Impl();
+
+    HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, g_device.GetAddressOf(), g_context.GetAddressOf());
+    if (FAILED(hr)) return -1;
+
+    hr = g_device->OpenSharedResource((HANDLE)ioSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_ioTex.GetAddressOf());
+    if (FAILED(hr)) return -2;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    g_ioTex->GetDesc(&desc);
+    if (desc.Format != DXGI_FORMAT_R16_UINT) return -5;
+
+    g_w = (int)desc.Width;
+    g_h = (int)desc.Height;
+
+    int cr = CudaSetDeviceSafe((int)gpuId);
+    if (cr != 0) return -1000 - cr;
+
+    cr = CudaRegisterD3D11Texture(g_ioTex.Get(), &g_cudaIO);
+    if (cr != 0) return -1100 - cr;
+
+    // default params
+    IPC_Params p{};
+    p.sizeBytes = sizeof(IPC_Params);
+    p.version = 1;
+    p.window = 4000;
+    p.level = 2000;
+    p.enableEdge = 0;
+    p.reserved[0] = 0;
+
+    g_params = p;
+
+    g_initialized.store(true);
+    return IPC_OK;
+}
+
+static int32_t InitWithIoBuffer_Impl(int32_t gpuId, void* ioBufferPtr)
+{
+    if (!ioBufferPtr) return IPC_ERR_INVALIDARG;
+
+    Shutdown_Impl();
+
+    IUnknown* unk = (IUnknown*)ioBufferPtr;
+
+    ComPtr<ID3D11Buffer> buf;
+    HRESULT hr = unk->QueryInterface(__uuidof(ID3D11Buffer), (void**)buf.GetAddressOf());
+    if (FAILED(hr)) return -201;
+
+    ComPtr<ID3D11Device> dev;
+    buf->GetDevice(dev.GetAddressOf());
+    if (!dev) return -202;
+
+    ComPtr<ID3D11DeviceContext> ctx;
+    dev->GetImmediateContext(ctx.GetAddressOf());
+    if (!ctx) return -203;
+
+    g_device = dev;
+    g_context = ctx;
+    g_ioBuf = buf;
+    g_ioTex.Reset();
+
+    D3D11_BUFFER_DESC bd{};
+    g_ioBuf->GetDesc(&bd);
+    if ((bd.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
+        return -204;
+
+    int cr = CudaSetDeviceSafe((int)gpuId);
+    if (cr != 0) return -1000 - cr;
+
+    cr = CudaRegisterD3D11Buffer(g_ioBuf.Get(), &g_cudaIO);
+    if (cr != 0) return -1200 - cr;
+
+    // default params（Texture版Initと同様）
+    IPC_Params p{};
+    p.sizeBytes = sizeof(IPC_Params);
+    p.version = 1;
+    p.window = 4000;
+    p.level = 2000;
+    p.enableEdge = 0;
+    p.reserved[0] = 0;
+    g_params = p;
+
+    g_initialized.store(true);
+    return IPC_OK;
+}
+
+static int32_t SetParams_Impl(const IPC_Params* p)
+{
+    int32_t v = ValidateParams(p);
+    if (v != IPC_OK) return v;
+    if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+
+    g_params = *p;
+    g_w = p->width;
+    g_h = p->height;
+    return IPC_OK;
+}
+
+static int32_t Execute_Impl()
+{
+    if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+    if (!g_cudaIO) return IPC_ERR_NOT_INITIALIZED;
+
+    IPC_Params p = g_params;
+
+    int enableBlur = p.reserved[0];
+    int enableInvert = p.reserved[1];
+    int enableThreshold = p.reserved[2];
+    int thresholdValue = p.reserved[3];
+
+    int cr = 0;
+    int cr2 = 0;
+
+    if (g_ioTex)
+    {
+        void* ioArr = nullptr;
+        cr = CudaMapGetArrayMapped(g_cudaIO, &ioArr);
+        if (cr != 0) return -1300 - cr;
+
+        cr = CudaProcessArray_R16_Inplace(
+            ioArr, g_w, g_h,
+            p.window, p.level,
+            p.enableEdge,
+            enableBlur,
+            enableInvert,
+            enableThreshold,
+            thresholdValue);
+
+        cr2 = CudaUnmapResource(g_cudaIO);
+
+        if (cr != 0)  return -1400 - cr;
+        if (cr2 != 0) return -1500 - cr2;
+        return IPC_OK;
+    }
+
+    if (g_ioBuf)
+    {
+        void* devPtr = nullptr;
+        size_t mappedBytes = 0;
+
+        cr = CudaMapGetPointerMapped(g_cudaIO, &devPtr, &mappedBytes);
+        if (cr != 0) return -1310 - cr;
+
+        const size_t required = (size_t)g_w * (size_t)g_h * 2u;
+        if (mappedBytes < required)
+        {
+            CudaUnmapResource(g_cudaIO);
+            return IPC_ERR_INVALID_STATE;
+        }
+
+        cr = CudaProcessBuffer_R16_Inplace(
+            devPtr, g_w, g_h,
+            p.window, p.level,
+            p.enableEdge,
+            enableBlur,
+            enableInvert,
+            enableThreshold,
+            thresholdValue);
+
+        cr2 = CudaUnmapResource(g_cudaIO);
+
+        if (cr != 0)  return -1410 - cr;
+        if (cr2 != 0) return -1510 - cr2;
+        return IPC_OK;
+    }
+
+    return IPC_ERR_NOT_INITIALIZED;
+}
+
+
+
 extern "C" {
 
     int32_t __cdecl IPC_Init(int32_t gpuId, void* ioSharedHandle)
     {
-        if (!ioSharedHandle) return IPC_ERR_INVALIDARG;
-
-        IPC_Shutdown();
-
-        HRESULT hr = CreateDeviceOnAdapterIndex((int)gpuId, g_device.GetAddressOf(), g_context.GetAddressOf());
-        if (FAILED(hr)) return -1;
-
-        hr = g_device->OpenSharedResource((HANDLE)ioSharedHandle, __uuidof(ID3D11Texture2D), (void**)g_ioTex.GetAddressOf());
-        if (FAILED(hr)) return -2;
-
-        D3D11_TEXTURE2D_DESC desc{};
-        g_ioTex->GetDesc(&desc);
-
-        if (desc.Format != DXGI_FORMAT_R16_UINT) return -5;
-
-        g_w = (int)desc.Width;
-        g_h = (int)desc.Height;
-
-
-        // CUDA device select
-        int cr = CudaSetDeviceSafe((int)gpuId);
-        if (cr != 0) return -1000 - cr;
-
-        cr = CudaRegisterD3D11Texture(g_ioTex.Get(), &g_cudaIO);
-        if (cr != 0) return -1100 - cr;
-
-        // default params
-        IPC_Params p{};
-        p.sizeBytes = sizeof(IPC_Params);
-        p.version = 1;
-        p.window = 4000;
-        p.level = 2000;
-        p.enableEdge = 0;
-        p.reserved[0] = 0; // enablePostFilter default OFF
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_params = p;
-        }
-
-        g_initialized.store(true);
-        return IPC_OK;
+        // 外スレッドで呼ばれてOK：中身はGPUスレッドで実行
+        return g_worker.SubmitAndWait([=]() -> int32_t {
+            return InitWithSharedHandle_Impl(gpuId, ioSharedHandle);
+            });
     }
 
     int32_t __cdecl IPC_InitWithIoBuffer(int32_t gpuId, void* ioBufferPtr)
     {
-        if (!ioBufferPtr) return IPC_ERR_INVALIDARG;
-
-        // 既存リソース解放（g_cudaIO unregister / g_ioTex,g_ioBuf reset 等）
-        IPC_Shutdown();
-
-        // 受け取ったポインタは COM。IUnknown から ID3D11Buffer を取得して保持する。
-        IUnknown* unk = (IUnknown*)ioBufferPtr;
-
-        Microsoft::WRL::ComPtr<ID3D11Buffer> buf;
-        HRESULT hr = unk->QueryInterface(__uuidof(ID3D11Buffer), (void**)buf.GetAddressOf());
-        if (FAILED(hr)) return -201; // "not a buffer"
-
-        // このバッファを作ったデバイスを採用する（推奨：デバイスミスマッチ回避）
-        Microsoft::WRL::ComPtr<ID3D11Device> dev;
-        buf->GetDevice(dev.GetAddressOf());
-        if (!dev) return -202;
-
-        Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx;
-        dev->GetImmediateContext(ctx.GetAddressOf());
-        if (!ctx) return -203;
-
-        // 保存（Texture版は使わない）
-        g_device = dev;
-        g_context = ctx;
-        g_ioBuf = buf;
-        g_ioTex.Reset();
-
-        // Buffer descチェック（最低限）
-        D3D11_BUFFER_DESC bd{};
-        g_ioBuf->GetDesc(&bd);
-
-        // CUDAから書き込みたいなら UAV を要求するのが無難
-        if ((bd.BindFlags & D3D11_BIND_UNORDERED_ACCESS) == 0)
-            return -204;
-
-        // CUDA device select（従来どおり）
-        int cr = CudaSetDeviceSafe((int)gpuId);
-        if (cr != 0) return -1000 - cr;
-
-        // CUDA登録：Textureではなく Buffer を登録する
-        // ここはあなたの CudaRegisterD3D11Texture の “Buffer版” を用意するのが一番きれい
-        // 直接書くなら cudaGraphicsD3D11RegisterResource
-        cr = CudaRegisterD3D11Buffer(g_ioBuf.Get(), &g_cudaIO);
-        if (cr != 0) return -1200 - cr;
-
-
-        g_initialized.store(true);
-        return 0;
+        return g_worker.SubmitAndWait([=]() -> int32_t {
+            return InitWithIoBuffer_Impl(gpuId, ioBufferPtr);
+            });
     }
 
 
     int32_t __cdecl IPC_SetParams(const IPC_Params* p)
     {
-        int32_t v = ValidateParams(p);
-        if (v != IPC_OK) return v;
-        if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
+        // スナップショット（呼び出し側が返った後にpが無効になる可能性があるのでコピー必須）
+        if (!p) return IPC_ERR_INVALIDARG;
+        IPC_Params copy = *p;
 
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_params = *p;
-        g_w = p->width;
-        g_h = p->height;
-        return IPC_OK;
+        return g_worker.SubmitAndWait([=]() -> int32_t {
+            return SetParams_Impl(&copy);
+            });
     }
 
     //int32_t __cdecl IPC_Execute()
@@ -313,106 +504,22 @@ extern "C" {
 
     int32_t __cdecl IPC_Execute()
     {
-        if (!g_initialized.load()) return IPC_ERR_NOT_INITIALIZED;
-        if (!g_cudaIO) return IPC_ERR_NOT_INITIALIZED;
-
-        IPC_Params p;
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            p = g_params;
-        }
-
-        int enableBlur = p.reserved[0];
-        int enableInvert = p.reserved[1];
-        int enableThreshold = p.reserved[2];
-        int thresholdValue = p.reserved[3];
-
-        int cr = 0;
-        int cr2 = 0;
-
-        // --- Texture path (legacy) ---
-        if (g_ioTex)
-        {
-            void* ioArr = nullptr;
-            cr = CudaMapGetArrayMapped(g_cudaIO, &ioArr);
-            if (cr != 0) return -1300 - cr;
-
-            cr = CudaProcessArray_R16_Inplace(
-                ioArr, g_w, g_h,
-                p.window, p.level,
-                p.enableEdge,
-                enableBlur,
-                enableInvert,
-                enableThreshold,
-                thresholdValue);
-
-            cr2 = CudaUnmapResource(g_cudaIO);
-
-            if (cr != 0) return -1400 - cr;
-            if (cr2 != 0) return -1500 - cr2;
-            return IPC_OK;
-        }
-
-        // --- Buffer path (new) ---
-        if (g_ioBuf)
-        {
-            void* devPtr = nullptr;
-            size_t mappedBytes = 0;
-
-            cr = CudaMapGetPointerMapped(g_cudaIO, &devPtr, &mappedBytes);
-            if (cr != 0) return -1310 - cr;
-
-            // mappedBytes sanity (optional)
-            const size_t required = (size_t)g_w * (size_t)g_h * 2u;
-            if (mappedBytes < required)
-            {
-                CudaUnmapResource(g_cudaIO);
-                return IPC_ERR_INVALID_STATE;
-            }
-
-            cr = CudaProcessBuffer_R16_Inplace(
-                devPtr, g_w, g_h,
-                p.window, p.level,
-                p.enableEdge,
-                enableBlur,
-                enableInvert,
-                enableThreshold,
-                thresholdValue);
-
-            cr2 = CudaUnmapResource(g_cudaIO);
-
-            if (cr != 0) return -1410 - cr;
-            if (cr2 != 0) return -1510 - cr2;
-            return IPC_OK;
-        }
-
-        return IPC_ERR_NOT_INITIALIZED;
+        return g_worker.SubmitAndWait([=]() -> int32_t {
+            return Execute_Impl();
+            });
     }
 
 
     int32_t __cdecl IPC_Shutdown()
     {
-        g_initialized.store(false);
+        // 1) release GPU/D3D/CUDA resources on worker
+        int32_t r = g_worker.SubmitAndWait([=]() -> int32_t {
+            return Shutdown_Impl();
+            });
 
-        if (g_cudaIO) { CudaUnregister(g_cudaIO); g_cudaIO = nullptr; }
-
-        CudaReleaseCache();
-
-        g_stagingUpload.Reset();
-        g_stagingReadback.Reset();
-        g_stagingUploadBuf.Reset();
-        g_stagingReadbackBuf.Reset();
-
-        g_ioTex.Reset();
-        g_ioBuf.Reset();
-
-        g_context.Reset();
-        g_device.Reset();
-
-        g_w = 0;
-        g_h = 0;
-
-        return IPC_OK;
+        // 2) stop worker thread (optional: keep alive if you prefer)
+        g_worker.Stop();
+        return r;
     }
 
     int32_t __cdecl IPC_UploadRaw16(const void* src, int32_t srcBytes)
