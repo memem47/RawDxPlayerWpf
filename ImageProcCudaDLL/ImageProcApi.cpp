@@ -19,9 +19,34 @@ using Microsoft::WRL::ComPtr;
 // ------------------------------
 // GPU Worker (single-thread executor)
 // ------------------------------
+/*
+ * GpuWorker
+ *
+ * GPU / CUDA / D3D のような「スレッド制約が厳しいAPI」を
+ * *常に同一スレッド上* で直列実行するためのシングルスレッド実行器。
+ *
+ * - SubmitAndWait() に渡された処理は必ずワーカースレッド上で実行される
+ * - 呼び出し元スレッドは future.get() により同期的に完了を待つ
+ * - GPUコンテキスト・D3Dデバイス・CUDA interop は
+ *   **このスレッド以外から絶対に触ってはならない**
+ *
+ * 想定用途:
+ *   - P/Invoke / C API からの GPU 処理呼び出し
+ *   - UIスレッドや任意スレッドからの安全な GPU 実行
+ */
 class GpuWorker
 {
 public:
+    /*
+     * Start
+     *
+     * ワーカースレッドを起動する。
+     * すでに起動済みの場合は何もしない（冪等）。
+     *
+     * NOTE:
+     *  - 実際のスレッド生成は SubmitAndWait() から暗黙的に呼ばれる想定
+     *  - 明示的に呼んでも安全
+     */
     void Start()
     {
         std::lock_guard<std::mutex> lk(m_);
@@ -31,6 +56,18 @@ public:
         running_ = true;
     }
 
+    /*
+     * Stop
+     *
+     * ワーカースレッドに停止要求を出し、完全終了を待つ。
+     *
+     * - すでに停止済みの場合は何もしない
+     * - キュー内のタスクは全て処理されてから終了する
+     *
+     * IMPORTANT:
+     *  - プロセス終了時や DLL unload 前に必ず呼ぶこと
+     *  - GPUリソース解放前にスレッドが止まることを保証する
+     */
     void Stop()
     {
         {
@@ -38,25 +75,65 @@ public:
             if (!running_) return;
             stop_ = true;
         }
+        
+        // 待機中のスレッドを起こす
         cv_.notify_all();
+        
+        // ワーカースレッドの完全終了を待つ
         if (th_.joinable()) th_.join();
+
         running_ = false;
     }
 
+    /*
+     * SubmitAndWait
+     *
+     * 指定した処理を GPU ワーカースレッドに投入し、
+     * 完了するまで呼び出し元スレッドをブロックする。
+     *
+     * @param fn
+     *   GPU スレッド上で実行したい処理
+     *   - GPU / D3D / CUDA API を直接触ってよい
+     *   - 例外を投げてはならない（未定義動作）
+     *
+     * @return
+     *   処理結果（int32_t）
+     *
+     * THREADING:
+     *   - 呼び出し元スレッド: 任意
+     *   - 実行スレッド: GPU worker スレッド
+     */
     int32_t SubmitAndWait(std::function<int32_t()> fn)
     {
+        // 必要ならスレッドを起動
         Start();
+        // タスクを future でラップし、同期結果を取得可能にする
         std::packaged_task<int32_t()> task(std::move(fn));
         auto fut = task.get_future();
         {
             std::lock_guard<std::mutex> lk(m_);
             q_.push(std::move(task));
         }
+        // ワーカースレッドを起こす
         cv_.notify_one();
+        // 実行完了を待つ（同期点）
         return fut.get();
     }
 
 private:
+    /*
+     * Run
+     *
+     * ワーカースレッドのメインループ。
+     *
+     * - stop_ が立つまでループ
+     * - キューが空なら condition_variable で待機
+     * - 1タスクずつ直列実行
+     *
+     * NOTE:
+     *  - この関数は th_ スレッドからのみ呼ばれる
+     *  - ここで GPU / CUDA / D3D API を使用する
+     */
     void Run()
     {
         while (true)
@@ -64,68 +141,134 @@ private:
             std::packaged_task<int32_t()> task;
             {
                 std::unique_lock<std::mutex> lk(m_);
+                // stop 要求 または タスク到着まで待機
                 cv_.wait(lk, [&] { return stop_ || !q_.empty(); });
+                // 停止要求かつキュー空 → 完全終了
                 if (stop_ && q_.empty()) break;
+                // 次のタスクを取得
                 task = std::move(q_.front());
                 q_.pop();
             }
+            // GPUジョブ実行（例外非対応）
             task(); // execute job
         }
     }
 
-    std::thread th_;
-    std::mutex m_;
+    std::thread th_; // GPU 専用ワーカースレッド
+    std::mutex m_;   // キュー・状態保護用 mutex
     std::condition_variable cv_;
+    // 実行待ちタスクキュー（FIFO）
     std::queue<std::packaged_task<int32_t()>> q_;
-    bool stop_ = false;
-    bool running_ = false;
+    bool stop_ = false;    // 停止要求フラグ
+    bool running_ = false; // スレッド稼働中フラグ
 };
 
+// プロセス全体で共有される GPU ワーカー
+// - GPU 操作は必ずこれ経由で行う
 static GpuWorker g_worker;
 
+// ------------------------------
+// IPC / GPU context
+// ------------------------------
+/*
+ * IpcContext
+ *
+ * GPU ワーカースレッド専用の実行コンテキスト。
+ *
+ * OWNERSHIP:
+ *   - g_ctx により一意に所有される
+ *   - GPU worker スレッド以外からアクセス禁止
+ *
+ * ROLE:
+ *   - D3D11 デバイス / コンテキスト管理
+ *   - CUDA-D3D interop リソース管理
+ *   - 入出力用 staging / shared リソース管理
+ *   - 現在有効な画像サイズ・処理パラメータ保持
+ */
 struct IpcContext
 {
-    // D3D
+    // --------------------------
+    // D3D11 core objects
+    // --------------------------
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
 
+    // --------------------------
+    // Active IO resources
+    // （どちらか一方が有効）
+    // --------------------------
     Microsoft::WRL::ComPtr<ID3D11Texture2D> ioTex;   // shared IO texture path
     Microsoft::WRL::ComPtr<ID3D11Buffer>    ioBuf;   // IO buffer path
 
+    // --------------------------
+    // CPU-GPU staging resources
+    // --------------------------
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingUpload;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingReadback;
     Microsoft::WRL::ComPtr<ID3D11Buffer>    stagingUploadBuf;
     Microsoft::WRL::ComPtr<ID3D11Buffer>    stagingReadbackBuf;
 
-    // CUDA interop (opaque pointer managed by CudaInterop.cu)
+    // --------------------------
+    // CUDA interop handle
+    // --------------------------
+    // - 登録 / 解除は CudaInterop.cu 側で行う
+    // - lifetime はこの context に完全に従属
     cudaGraphicsResource* cudaIO = nullptr;
 
-    // image size (active IO resource)
+    // --------------------------
+    // Active image size
+    // --------------------------
     int w = 0;
     int h = 0;
 
-    // latest params (owned by GPU worker thread only)
+    // --------------------------
+    // Latest processing parameters
+    // --------------------------
+    // NOTE:
+    //  - GPU worker スレッドのみが読み書きする
     IPC_Params params{};
 
     bool initialized = false;
 
-    // Convenience
+    /*
+     * Reset
+     *
+     * 全 GPU / D3D / CUDA リソースを安全に破棄し、
+     * 初期化前状態に戻す。
+     *
+     * THREADING:
+     *   - GPU worker スレッド上でのみ呼ぶこと
+     *
+     * USE CASE:
+     *   - 解像度変更
+     *   - IO パス変更
+     *   - デバイス再初期化
+     */
     void Reset()
     {
         initialized = false;
 
-        if (cudaIO) { CudaUnregister(cudaIO); cudaIO = nullptr; }
+        // CUDA interop の解除
+        if (cudaIO) 
+        { 
+            CudaUnregister(cudaIO); 
+            cudaIO = nullptr; 
+        }
 
+        // CUDA 側のキャッシュ解放（mallocAsync 等）
         CudaReleaseCache();
 
+        // D3D staging resources
         stagingUpload.Reset();
         stagingReadback.Reset();
         stagingUploadBuf.Reset();
         stagingReadbackBuf.Reset();
 
+        // Active IO resources
         ioTex.Reset();
         ioBuf.Reset();
 
+        // D3D core
         context.Reset();
         device.Reset();
 
@@ -134,7 +277,8 @@ struct IpcContext
     }
 };
 
-// Single active context (owned/used only on GPU worker thread)
+// GPU worker スレッドに所有される唯一の実行コンテキスト
+// - 生成 / 破棄 / 使用は SubmitAndWait 内からのみ行う
 static std::unique_ptr<IpcContext> g_ctx;
 
 static ComPtr<ID3D11Texture2D>     g_ownedSharedTex;  // Createした実体（Init前）
