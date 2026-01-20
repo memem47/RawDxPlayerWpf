@@ -5,14 +5,13 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 
-#include <atomic>
-#include <mutex>
-
 #include <thread>
 #include <condition_variable>
 #include <queue>
 #include <future>
 #include <functional>
+#include <vector>
+#include <cstring>
 
 using Microsoft::WRL::ComPtr;
 
@@ -354,6 +353,7 @@ static int32_t InitWithIoBuffer_Impl(int32_t gpuId, void* ioBufferPtr)
     int cr = CudaSetDeviceSafe((int)gpuId);
     if (cr != 0) return -1000 - cr;
 
+
     cr = CudaRegisterD3D11Buffer(g_ctx->ioBuf.Get(), &g_ctx->cudaIO);
     if (cr != 0) return -1200 - cr;
 
@@ -442,6 +442,9 @@ static int32_t Execute_Impl()
     return IPC_ERR_NOT_INITIALIZED;
 }
 
+// ------------------------------
+// Upload / Readback Impl (MUST be called on GPU worker thread)
+// ------------------------------
 static int32_t UploadRaw16_Impl(const void* src, int32_t srcBytes)
 {
     if (!src) return IPC_ERR_INVALID_ARG;
@@ -465,9 +468,7 @@ static int32_t UploadRaw16_Impl(const void* src, int32_t srcBytes)
     const int dstPitch = (int)mapped.RowPitch;
 
     for (int y = 0; y < g_ctx->h; y++)
-    {
-        memcpy(dst + y * dstPitch, in + y * rowBytes, rowBytes);
-    }
+        std::memcpy(dst + y * dstPitch, in + y * rowBytes, rowBytes);
 
     g_ctx->context->Unmap(g_ctx->stagingUpload.Get(), 0);
 
@@ -481,15 +482,15 @@ static int32_t UploadRaw16ToBuffer_Impl(const void* src, int32_t srcBytes, int32
     if (!src) return IPC_ERR_INVALID_ARG;
     if (!g_ctx || !g_ctx->initialized) return IPC_ERR_NOT_INITIALIZED;
     if (!g_ctx->device || !g_ctx->context || !g_ctx->ioBuf) return IPC_ERR_NOT_INITIALIZED;
+    if (width <= 0 || height <= 0) return IPC_ERR_INVALID_STATE;
 
     g_ctx->w = width;
     g_ctx->h = height;
-    if (g_ctx->w <= 0 || g_ctx->h <= 0) return IPC_ERR_INVALID_STATE;
 
     const int32_t required = g_ctx->w * g_ctx->h * 2;
     if (srcBytes < required) return IPC_ERR_INVALID_ARG;
 
-    // IO buffer capacity check
+    // IOバッファ容量チェック（安全）
     D3D11_BUFFER_DESC ioDesc{};
     g_ctx->ioBuf->GetDesc(&ioDesc);
     if ((int32_t)ioDesc.ByteWidth < required)
@@ -502,9 +503,11 @@ static int32_t UploadRaw16ToBuffer_Impl(const void* src, int32_t srcBytes, int32
     hr = g_ctx->context->Map(g_ctx->stagingUploadBuf.Get(), 0, D3D11_MAP_WRITE, 0, &mapped);
     if (FAILED(hr) || !mapped.pData) return IPC_ERR_INTERNAL;
 
-    memcpy(mapped.pData, src, required);
+    std::memcpy(mapped.pData, src, required);
+
     g_ctx->context->Unmap(g_ctx->stagingUploadBuf.Get(), 0);
 
+    // staging -> IO（Buffer）
     g_ctx->context->CopyResource(g_ctx->ioBuf.Get(), g_ctx->stagingUploadBuf.Get());
     return IPC_OK;
 }
@@ -521,7 +524,7 @@ static int32_t ReadbackRaw16_Impl(void* dst, int32_t dstBytes)
     HRESULT hr = EnsureReadbackStaging();
     if (FAILED(hr) || !g_ctx->stagingReadback) return IPC_ERR_INTERNAL;
 
-    // GPU -> staging
+    // GPU copy -> staging
     g_ctx->context->CopyResource(g_ctx->stagingReadback.Get(), g_ctx->ioTex.Get());
     g_ctx->context->Flush();
 
@@ -535,9 +538,7 @@ static int32_t ReadbackRaw16_Impl(void* dst, int32_t dstBytes)
     const int srcPitch = (int)mapped.RowPitch;
 
     for (int y = 0; y < g_ctx->h; y++)
-    {
-        memcpy(out + y * rowBytes, src + y * srcPitch, rowBytes);
-    }
+        std::memcpy(out + y * rowBytes, src + y * srcPitch, rowBytes);
 
     g_ctx->context->Unmap(g_ctx->stagingReadback.Get(), 0);
     return IPC_OK;
@@ -567,10 +568,12 @@ static int32_t ReadbackRaw16FromBuffer_Impl(void* dst, int32_t dstBytes)
     hr = g_ctx->context->Map(g_ctx->stagingReadbackBuf.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr) || !mapped.pData) return IPC_ERR_INTERNAL;
 
-    memcpy(dst, mapped.pData, required);
+    std::memcpy(dst, mapped.pData, required);
+
     g_ctx->context->Unmap(g_ctx->stagingReadbackBuf.Get(), 0);
     return IPC_OK;
 }
+
 
 
 

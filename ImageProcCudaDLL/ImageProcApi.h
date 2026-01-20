@@ -67,7 +67,7 @@ extern "C" {
 
     
     IPC_API int __cdecl CudaUnmapResource(cudaGraphicsResource* ioRes);
-
+    
     // In-place processing using intermediate array(s) inside CUDA
     IPC_API int __cdecl CudaProcessArray_R16_Inplace(
         void* ioArray,

@@ -2,6 +2,50 @@
 #include <cuda_runtime.h>
 #include <cuda_d3d11_interop.h>
 
+struct CudaContext
+{
+    int device = 0;
+    cudaStream_t stream = nullptr;
+
+    // Optional: keep cache buffers here (replacing static globals)
+    void* midBuf = nullptr;       // linear temp buffer
+    size_t midBufBytes = 0;
+
+    cudaArray_t midArr = nullptr; // optional, if you use array/surface temp
+    int w = 0;
+    int h = 0;
+
+    bool inited = false;
+};
+
+static void CudaContext_Destroy(CudaContext* c)
+{
+    if (!c) return;
+
+    if (c->midArr)
+    {
+        // If allocated with cudaMallocArray / cudaFreeArray
+        cudaFreeArray(c->midArr);
+        c->midArr = nullptr;
+    }
+
+    if (c->midBuf)
+    {
+        // IMPORTANT: use same stream for freeAsync
+        cudaFreeAsync(c->midBuf, c->stream);
+        c->midBuf = nullptr;
+        c->midBufBytes = 0;
+    }
+
+    if (c->stream)
+    {
+        cudaStreamDestroy(c->stream);
+        c->stream = nullptr;
+    }
+
+    c->inited = false;
+}
+
 // ============================================================
 // Cached intermediate array (MID) : reuse across frames
 // ============================================================
@@ -197,6 +241,32 @@ extern "C" int CudaUnmapResources(cudaGraphicsResource* ioRes)
 
     return 0;
 }
+
+extern "C" int CudaContext_Init(CudaContext* c, int device)
+{
+    if (!c) return -1;
+    c->device = device;
+
+    cudaError_t e = cudaSetDevice(device);
+    if (e != cudaSuccess) return (int)e;
+
+    e = cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking);
+    if (e != cudaSuccess) return (int)e;
+
+    // ---- mempool tuning (optional but recommended) ----
+    cudaMemPool_t pool = nullptr;
+    e = cudaDeviceGetDefaultMemPool(&pool, device);
+    if (e == cudaSuccess && pool)
+    {
+        // keep cached memory (example: 512MB; adjust later)
+        unsigned long long threshold = 512ull * 1024ull * 1024ull;
+        cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+    }
+
+    c->inited = true;
+    return 0;
+}
+
 
 // ============================================================
 // Utility: create texture/surface from array
