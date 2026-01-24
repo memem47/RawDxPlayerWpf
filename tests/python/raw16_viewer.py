@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QFormLayout, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QComboBox, QCheckBox
 )
 
-
 # -----------------------------
 # RAW size inference
 # -----------------------------
@@ -113,6 +112,27 @@ def normalize_minmax_to_u8(img: np.ndarray) -> np.ndarray:
     y = (x - mn) / (mx - mn)
     y = np.clip(y, 0.0, 1.0)
     return (y * 255.0 + 0.5).astype(np.uint8)
+
+
+def calc_stats(arr: np.ndarray) -> Tuple[int, float, float, float, float]:
+    """(n_pixels, mean, std, min, max) as python scalars."""
+    # mean/std は float64 で返す。差分(i32)もOK。
+    n = int(arr.size)
+    if n == 0:
+        return (0, 0.0, 0.0, 0.0, 0.0)
+    x = arr.astype(np.float64, copy=False)
+    mean = float(np.mean(x))
+    std = float(np.std(x))
+    mn = float(np.min(x))
+    mx = float(np.max(x))
+    return (n, mean, std, mn, mx)
+
+
+def format_stats_line(title: str, st: Tuple[int, float, float, float, float], show_n: bool = True) -> str:
+    n, mean, std, mn, mx = st
+    if show_n:
+        return f"{title}: n={n:,}  mean={mean:.3f}  std={std:.3f}  min={mn:.0f}  max={mx:.0f}"
+    return f"{title}: mean={mean:.3f}  std={std:.3f}  min={mn:.0f}  max={mx:.0f}"
 
 
 # -----------------------------
@@ -220,7 +240,7 @@ class MainWindow(QMainWindow):
         # --- diff feature ---
         self.ref: Optional[LoadedRaw] = None          # 差分に使う画像（u16）
         self.diff_i32: Optional[np.ndarray] = None    # base - ref（i32）
-        self.view_mode: str = "base"                  # "base" | "ref" | "diff"
+        self.view_mode: str = "base"                # "base" | "ref" | "diff"
         self.diff_auto_dir: str = ""               # 自動差分元探索に使うフォルダ（差分画像選択で決める）
 
         # UI
@@ -303,22 +323,46 @@ class MainWindow(QMainWindow):
         f.addRow("WL", self._pair(self.sld_wl, self.spn_wl))
         f.addRow("WW", self._pair(self.sld_ww, self.spn_ww))
 
-        # Info labels
+        # Info labels (cursor / zoom)
         self.lbl_mouse = QLabel("x=?, y=?, value=?")
-        # 右パネルのガタつき対策：複数行 + 等幅フォント + 幅固定
         self.lbl_mouse.setTextFormat(Qt.PlainText)
         self.lbl_mouse.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.lbl_mouse.setWordWrap(False)
-        self.lbl_mouse.setMinimumWidth(320)   # ここは好みで 300〜400
-        self.lbl_mouse.setFixedHeight(70)     # 2〜3行表示の高さ確保
+        self.lbl_mouse.setMinimumWidth(360)
+        self.lbl_mouse.setFixedHeight(70)
 
         font = self.lbl_mouse.font()
-        font.setFamily("Consolas")  # Windows 等幅
+        font.setFamily("Consolas")
         self.lbl_mouse.setFont(font)
+
         self.lbl_zoom = QLabel("zoom=1.00")
-        right.addWidget(QGroupBox("情報"))
-        right.addWidget(self.lbl_mouse)
-        right.addWidget(self.lbl_zoom)
+
+        # Stats labels (NEW)
+        self.lbl_stats_display = QLabel("表示中: (未選択)")
+        self.lbl_stats_display.setTextFormat(Qt.PlainText)
+        self.lbl_stats_display.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.lbl_stats_display.setWordWrap(True)
+        self.lbl_stats_display.setMinimumWidth(360)
+
+        self.lbl_stats_diff = QLabel("差分: (未選択)")
+        self.lbl_stats_diff.setTextFormat(Qt.PlainText)
+        self.lbl_stats_diff.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.lbl_stats_diff.setWordWrap(True)
+        self.lbl_stats_diff.setMinimumWidth(360)
+
+        # Grouping on right panel
+        g_info = QGroupBox("情報")
+        info_layout = QVBoxLayout(g_info)
+        info_layout.addWidget(self.lbl_mouse)
+        info_layout.addWidget(self.lbl_zoom)
+        right.addWidget(g_info)
+
+        g_stats = QGroupBox("統計")
+        stats_layout = QVBoxLayout(g_stats)
+        stats_layout.addWidget(self.lbl_stats_display)
+        stats_layout.addWidget(self.lbl_stats_diff)
+        right.addWidget(g_stats)
+
         right.addStretch(1)
 
         # Menu actions (optional convenience)
@@ -346,7 +390,7 @@ class MainWindow(QMainWindow):
         self.view.mouseImagePos.connect(self.on_mouse_pos)
         self.view.mouseOut.connect(self.on_mouse_out)
 
-        # Timer-less zoom label update: hook viewport events via mouse move + wheel is enough
+        # Timer-less zoom label update: hook viewport events
         self._viewport = self.view.viewport()
         self._viewport.installEventFilter(self)
 
@@ -403,14 +447,12 @@ class MainWindow(QMainWindow):
                 self.load_and_show(self.index, keep_wlww=True)
                 self.view.set_zoom(last_zoom)
                 # 差分元の復元
-                # - 自動ONかつフォルダが設定されている場合：現在の元画像と同名ファイルをそのフォルダから探して設定
-                # - 自動OFFの場合：最後に手動選択した差分元パスを復元（サイズが合えば）
                 if self.chk_auto_diff.isChecked() and self.diff_auto_dir:
                     self._auto_select_ref_for_current(silent=True)
                 elif last_diff_path and os.path.isfile(last_diff_path):
                     try:
                         ref = self.load_raw_u16(last_diff_path)
-                        if ref.shape == self.current.shape:
+                        if self.current is not None and ref.shape == self.current.shape:
                             self.ref = ref
                             self.lbl_diff.setText(f"差分元: {ref.path}")
                             self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
@@ -567,8 +609,10 @@ class MainWindow(QMainWindow):
             return
 
         self.current = loaded
-        self.lbl_name.setText(f"[{idx+1}/{len(self.raw_files)}]  {loaded.path}  "
-                              f"({loaded.shape[1]}x{loaded.shape[0]})  min={loaded.vmin} max={loaded.vmax}")
+        self.lbl_name.setText(
+            f"[{idx+1}/{len(self.raw_files)}]  {loaded.path}  "
+            f"({loaded.shape[1]}x{loaded.shape[0]})  min={loaded.vmin} max={loaded.vmax}"
+        )
 
         if not keep_wlww:
             wl = int((loaded.vmin + loaded.vmax) / 2)
@@ -619,7 +663,6 @@ class MainWindow(QMainWindow):
                 w.blockSignals(False)
 
     def on_wl_changed(self, v: int):
-        # unify from either slider or spin
         wl = int(self.sender().value())
         ww = int(self.spn_ww.value())
         self._set_wl_ww_ui(wl, ww, block_signals=True)
@@ -647,7 +690,6 @@ class MainWindow(QMainWindow):
             diff_v = int(value)
             if self.ref is not None:
                 ref_v = int(self.ref.img_u16[y, x])
-                # 改行 + 桁揃え
                 self.lbl_mouse.setText(
                     f"x={x:4d}, y={y:4d}\n"
                     f"base={base_v:6d}, ref={ref_v:6d}\n"
@@ -661,7 +703,7 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        # base/ref表示中（従来）→ ここも改行にすると安定
+        # base/ref表示中
         self.lbl_mouse.setText(
             f"x={x:4d}, y={y:4d}\n"
             f"value={int(value):6d}"
@@ -682,7 +724,6 @@ class MainWindow(QMainWindow):
     # -----------------------------
     def on_auto_diff_toggled(self, state: int):
         """自動ファイル選択ON/OFF時の挙動。"""
-        # ONにした瞬間に、フォルダが既に分かっていれば現在の画像に合わせて差分元を合わせる
         if self.chk_auto_diff.isChecked() and self.current is not None and self.diff_auto_dir:
             self._auto_select_ref_for_current(silent=True)
             self.render_by_mode()
@@ -698,7 +739,6 @@ class MainWindow(QMainWindow):
         cand = os.path.join(self.diff_auto_dir, base_name)
 
         if not os.path.isfile(cand):
-            # 見つからない：ラベルだけ更新（ポップアップは出さない）
             self.ref = None
             self.diff_i32 = None
             self.lbl_diff.setText(f"差分元(自動): 見つかりません: {cand}")
@@ -721,7 +761,6 @@ class MainWindow(QMainWindow):
             return False
 
         if self.current.shape != ref.shape:
-            # サイズ不一致：自動探索ではポップアップを避けてラベル更新のみ
             self.ref = None
             self.diff_i32 = None
             self.lbl_diff.setText(
@@ -760,7 +799,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        # 自動選択用フォルダを更新（チェックON/OFFに関係なく「最後に選んだフォルダ」として保持）
+        # 自動選択用フォルダを更新（チェックON/OFFに関係なく保持）
         self.diff_auto_dir = os.path.dirname(path)
         self.settings.setValue("last_diff_auto_dir", self.diff_auto_dir)
 
@@ -783,6 +822,7 @@ class MainWindow(QMainWindow):
                 if self.view_mode in ("ref", "diff"):
                     self.view_mode = "base"
                     self.cmb_view.setCurrentIndex(0)
+                self.update_stats_labels()
                 return
 
         # 読み込み（u16）
@@ -792,7 +832,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Load error", f"{os.path.basename(path)}\n\n{e}")
             return
 
-        # サイズチェック（②）
+        # サイズチェック
         if self.current.shape != ref.shape:
             QMessageBox.warning(
                 self,
@@ -804,58 +844,106 @@ class MainWindow(QMainWindow):
             self.ref = None
             self.diff_i32 = None
             self.lbl_diff.setText("差分元: (未選択)")
+            self.update_stats_labels()
             return
 
         self.ref = ref
-        # 自動ONならラベルに(自動)と出す
         if self.chk_auto_diff.isChecked():
             self.lbl_diff.setText(f"差分元(自動): {ref.path}")
         else:
             self.lbl_diff.setText(f"差分元: {ref.path}")
 
-        # 差分計算（③）
         self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
 
-        # 設定保存（任意）
         self.settings.setValue("last_diff_path", path)
 
-        # 表示が差分/差分元なら即更新
         self.render_by_mode()
 
     def on_view_mode_changed(self, idx: int):
-        # 0: base, 1: ref, 2: diff
         self.view_mode = ["base", "ref", "diff"][idx]
         self.settings.setValue("last_view_mode", self.view_mode)
         self.render_by_mode()
 
+    # -----------------------------
+    # Stats update (NEW)
+    # -----------------------------
+    def update_stats_labels(self):
+        # 1) 現在表示中の画像の統計
+        if self.current is None:
+            self.lbl_stats_display.setText("表示中: (未選択)")
+            self.lbl_stats_diff.setText("差分: (未選択)")
+            return
+
+        # 表示対象の配列を決める（view_modeに従う）
+        if self.view_mode == "base":
+            disp_arr = self.current.img_u16
+            disp_title = "表示中(base)"
+        elif self.view_mode == "ref":
+            if self.ref is not None:
+                disp_arr = self.ref.img_u16
+                disp_title = "表示中(ref)"
+            else:
+                disp_arr = self.current.img_u16
+                disp_title = "表示中(base)"  # フォールバック
+        else:  # diff
+            if self.diff_i32 is not None:
+                disp_arr = self.diff_i32
+                disp_title = "表示中(diff)"
+            else:
+                disp_arr = self.current.img_u16
+                disp_title = "表示中(base)"
+
+        st_disp = calc_stats(disp_arr)
+        self.lbl_stats_display.setText(format_stats_line(disp_title, st_disp, show_n=True))
+
+        # 2) 差分用画像が設定されているときは、差分画像の統計も表示
+        if self.ref is not None and self.diff_i32 is not None:
+            st_diff = calc_stats(self.diff_i32)
+            # 差分側は n を省略しても良いが、要件に「画素数」は差分側に明記されていないので省略
+            self.lbl_stats_diff.setText(format_stats_line("差分(diff)", st_diff, show_n=False))
+        else:
+            self.lbl_stats_diff.setText("差分: (未選択)")
+
+    # -----------------------------
+    # Rendering
+    # -----------------------------
     def render_by_mode(self):
         if self.current is None:
             self.view.clear_image()
+            self.update_stats_labels()
             return
 
         if self.view_mode == "base":
             self.render_base_or_ref(self.current.img_u16, use_wlww=True)
+            self.update_stats_labels()
             return
 
         if self.view_mode == "ref":
             if self.ref is None:
                 QMessageBox.information(self, "Info", "差分元画像が未選択です。")
                 self.cmb_view.setCurrentIndex(0)
+                self.view_mode = "base"
+                self.render_base_or_ref(self.current.img_u16, use_wlww=True)
+                self.update_stats_labels()
                 return
             self.render_base_or_ref(self.ref.img_u16, use_wlww=True)
+            self.update_stats_labels()
             return
 
         # diff
         if self.ref is None or self.diff_i32 is None:
             QMessageBox.information(self, "Info", "差分元画像が未選択です。")
             self.cmb_view.setCurrentIndex(0)
+            self.view_mode = "base"
+            self.render_base_or_ref(self.current.img_u16, use_wlww=True)
+            self.update_stats_labels()
             return
 
-        # 差分表示はmin-maxで表示（WL/WWは無視）
         gray = normalize_minmax_to_u8(self.diff_i32)
         qimg = qimage_from_gray_u8(gray)
         pix = QPixmap.fromImage(qimg)
         self.view.set_image(pix, self.diff_i32)
+        self.update_stats_labels()
 
     def render_base_or_ref(self, img_u16: np.ndarray, use_wlww: bool):
         if use_wlww:
