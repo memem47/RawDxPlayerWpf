@@ -10,7 +10,7 @@ from PySide6.QtGui import QImage, QPixmap, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSlider, QSpinBox, QGroupBox,
-    QFormLayout, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QComboBox
+    QFormLayout, QMessageBox, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QComboBox, QCheckBox
 )
 
 
@@ -99,6 +99,7 @@ def qimage_from_gray_u8(gray: np.ndarray) -> QImage:
     # Important: copy to own memory (otherwise numpy buffer lifetime issues)
     return qimg.copy()
 
+
 def normalize_minmax_to_u8(img: np.ndarray) -> np.ndarray:
     """
     任意の数値配列を min-max で 0..255 に正規化して uint8 にする。
@@ -112,6 +113,7 @@ def normalize_minmax_to_u8(img: np.ndarray) -> np.ndarray:
     y = (x - mn) / (mx - mn)
     y = np.clip(y, 0.0, 1.0)
     return (y * 255.0 + 0.5).astype(np.uint8)
+
 
 # -----------------------------
 # Zoomable graphics view with mouse tracking
@@ -200,8 +202,8 @@ class LoadedRaw:
 
 
 class MainWindow(QMainWindow):
-    ORG = "memem47"
-    APP = "raw16_viewer_pyside6"
+    ORG = "raw16_viewer"
+    APP = "pyside6"
 
     def __init__(self):
         super().__init__()
@@ -219,7 +221,8 @@ class MainWindow(QMainWindow):
         self.ref: Optional[LoadedRaw] = None          # 差分に使う画像（u16）
         self.diff_i32: Optional[np.ndarray] = None    # base - ref（i32）
         self.view_mode: str = "base"                  # "base" | "ref" | "diff"
-        
+        self.diff_auto_dir: str = ""               # 自動差分元探索に使うフォルダ（差分画像選択で決める）
+
         # UI
         root = QWidget()
         self.setCentralWidget(root)
@@ -231,6 +234,7 @@ class MainWindow(QMainWindow):
 
         self.btn_select = QPushButton("RAW選択...")
         self.btn_select_diff = QPushButton("差分画像選択...")
+        self.chk_auto_diff = QCheckBox("自動ファイル選択")
         self.btn_prev = QPushButton("前の画像")
         self.btn_next = QPushButton("次の画像")
         self.btn_reset_zoom = QPushButton("ズームリセット")
@@ -239,6 +243,7 @@ class MainWindow(QMainWindow):
 
         top.addWidget(self.btn_select)
         top.addWidget(self.btn_select_diff)
+        top.addWidget(self.chk_auto_diff)
         top.addWidget(self.btn_prev)
         top.addWidget(self.btn_next)
         top.addWidget(self.btn_reset_zoom)
@@ -300,7 +305,7 @@ class MainWindow(QMainWindow):
 
         # Info labels
         self.lbl_mouse = QLabel("x=?, y=?, value=?")
-                # 右パネルのガタつき対策：複数行 + 等幅フォント + 幅固定
+        # 右パネルのガタつき対策：複数行 + 等幅フォント + 幅固定
         self.lbl_mouse.setTextFormat(Qt.PlainText)
         self.lbl_mouse.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.lbl_mouse.setWordWrap(False)
@@ -324,6 +329,7 @@ class MainWindow(QMainWindow):
         # Signals
         self.btn_select.clicked.connect(self.on_select_raw)
         self.btn_select_diff.clicked.connect(self.on_select_diff_raw)
+        self.chk_auto_diff.stateChanged.connect(self.on_auto_diff_toggled)
         self.btn_prev.clicked.connect(lambda: self.step_index(-1))
         self.btn_next.clicked.connect(lambda: self.step_index(+1))
         self.btn_reset_zoom.clicked.connect(self.on_reset_zoom)
@@ -365,6 +371,7 @@ class MainWindow(QMainWindow):
             if et in (QEvent.Type.Wheel, QEvent.Type.Resize, QEvent.Type.MouseMove):
                 self.lbl_zoom.setText(f"zoom={self.view.get_zoom():.2f}")
         return super().eventFilter(obj, event)
+
     # -----------------------------
     # Persistence
     # -----------------------------
@@ -375,10 +382,18 @@ class MainWindow(QMainWindow):
         last_ww = self.settings.value("last_ww", 65535, type=int)
         last_zoom = self.settings.value("last_zoom", 1.0, type=float)
         last_diff_path = self.settings.value("last_diff_path", "", type=str)
+        last_diff_auto_enabled = self.settings.value("last_diff_auto_enabled", False, type=bool)
+        last_diff_auto_dir = self.settings.value("last_diff_auto_dir", "", type=str)
         last_view_mode = self.settings.value("last_view_mode", "base", type=str)
 
         # Pre-set WL/WW (may be overridden after first image load)
         self._set_wl_ww_ui(last_wl, max(1, last_ww), block_signals=True)
+
+        # 自動ファイル選択（差分元）の復元
+        self.chk_auto_diff.blockSignals(True)
+        self.chk_auto_diff.setChecked(bool(last_diff_auto_enabled))
+        self.chk_auto_diff.blockSignals(False)
+        self.diff_auto_dir = last_diff_auto_dir or ""
 
         if last_path and os.path.isfile(last_path):
             self.build_list_from_selected(last_path)
@@ -387,8 +402,12 @@ class MainWindow(QMainWindow):
                 self._sync_nav_widgets()
                 self.load_and_show(self.index, keep_wlww=True)
                 self.view.set_zoom(last_zoom)
-                # 差分元も復元（サイズが合えば）
-                if last_diff_path and os.path.isfile(last_diff_path):
+                # 差分元の復元
+                # - 自動ONかつフォルダが設定されている場合：現在の元画像と同名ファイルをそのフォルダから探して設定
+                # - 自動OFFの場合：最後に手動選択した差分元パスを復元（サイズが合えば）
+                if self.chk_auto_diff.isChecked() and self.diff_auto_dir:
+                    self._auto_select_ref_for_current(silent=True)
+                elif last_diff_path and os.path.isfile(last_diff_path):
                     try:
                         ref = self.load_raw_u16(last_diff_path)
                         if ref.shape == self.current.shape:
@@ -403,6 +422,7 @@ class MainWindow(QMainWindow):
                 self.view_mode = last_view_mode if last_view_mode in mode_to_idx else "base"
                 self.cmb_view.setCurrentIndex(mode_to_idx.get(self.view_mode, 0))
                 self.render_by_mode()
+
     def save_state(self):
         last_path = ""
         if self.raw_files and 0 <= self.index < len(self.raw_files):
@@ -413,6 +433,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("last_wl", int(self.spn_wl.value()))
         self.settings.setValue("last_ww", int(self.spn_ww.value()))
         self.settings.setValue("last_zoom", float(self.view.get_zoom()))
+        self.settings.setValue("last_diff_path", self.ref.path if self.ref is not None else "")
+        self.settings.setValue("last_diff_auto_enabled", bool(self.chk_auto_diff.isChecked()))
+        self.settings.setValue("last_diff_auto_dir", self.diff_auto_dir)
+        self.settings.setValue("last_view_mode", self.view_mode)
 
     def closeEvent(self, event):
         self.save_state()
@@ -550,18 +574,23 @@ class MainWindow(QMainWindow):
             wl = int((loaded.vmin + loaded.vmax) / 2)
             ww = max(1, int(loaded.vmax - loaded.vmin))
             self._set_wl_ww_ui(wl, ww, block_signals=True)
-        # もし差分元が設定済みで同サイズなら、差分を再計算
-        if self.ref is not None:
-            if self.ref.shape == self.current.shape:
-                self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
-            else:
-                # サイズが合わなくなったら解除
-                self.ref = None
-                self.diff_i32 = None
-                self.lbl_diff.setText("差分元: (未選択)")
-                if self.view_mode in ("ref", "diff"):
-                    self.view_mode = "base"
-                    self.cmb_view.setCurrentIndex(0)
+
+        # 差分元の自動選択（ONなら常に「現在の元画像と同名ファイル」を差分元フォルダから選ぶ）
+        if self.chk_auto_diff.isChecked() and self.diff_auto_dir:
+            self._auto_select_ref_for_current(silent=True)
+        else:
+            # 手動選択モード：差分元が設定済みで同サイズなら、差分を再計算
+            if self.ref is not None:
+                if self.ref.shape == self.current.shape:
+                    self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
+                else:
+                    # サイズが合わなくなったら解除
+                    self.ref = None
+                    self.diff_i32 = None
+                    self.lbl_diff.setText("差分元: (未選択)")
+                    if self.view_mode in ("ref", "diff"):
+                        self.view_mode = "base"
+                        self.cmb_view.setCurrentIndex(0)
 
         self.render_by_mode()
 
@@ -648,6 +677,74 @@ class MainWindow(QMainWindow):
         self.view.reset_zoom()
         self.lbl_zoom.setText(f"zoom={self.view.get_zoom():.2f}")
 
+    # -----------------------------
+    # Diff auto selection helpers
+    # -----------------------------
+    def on_auto_diff_toggled(self, state: int):
+        """自動ファイル選択ON/OFF時の挙動。"""
+        # ONにした瞬間に、フォルダが既に分かっていれば現在の画像に合わせて差分元を合わせる
+        if self.chk_auto_diff.isChecked() and self.current is not None and self.diff_auto_dir:
+            self._auto_select_ref_for_current(silent=True)
+            self.render_by_mode()
+
+    def _auto_select_ref_for_current(self, silent: bool = True) -> bool:
+        """現在の元画像(self.current)のファイル名と同名の差分元を self.diff_auto_dir から探して設定する。"""
+        if self.current is None:
+            return False
+        if not self.diff_auto_dir:
+            return False
+
+        base_name = os.path.basename(self.current.path)
+        cand = os.path.join(self.diff_auto_dir, base_name)
+
+        if not os.path.isfile(cand):
+            # 見つからない：ラベルだけ更新（ポップアップは出さない）
+            self.ref = None
+            self.diff_i32 = None
+            self.lbl_diff.setText(f"差分元(自動): 見つかりません: {cand}")
+            if self.view_mode in ("ref", "diff"):
+                self.view_mode = "base"
+                self.cmb_view.setCurrentIndex(0)
+            return False
+
+        try:
+            ref = self.load_raw_u16(cand)
+        except Exception as e:
+            self.ref = None
+            self.diff_i32 = None
+            self.lbl_diff.setText(f"差分元(自動): 読み込み失敗: {cand}")
+            if not silent:
+                QMessageBox.critical(self, "Load error", f"{os.path.basename(cand)}\n\n{e}")
+            if self.view_mode in ("ref", "diff"):
+                self.view_mode = "base"
+                self.cmb_view.setCurrentIndex(0)
+            return False
+
+        if self.current.shape != ref.shape:
+            # サイズ不一致：自動探索ではポップアップを避けてラベル更新のみ
+            self.ref = None
+            self.diff_i32 = None
+            self.lbl_diff.setText(
+                f"差分元(自動): サイズ不一致: {cand}  (base={self.current.shape[1]}x{self.current.shape[0]}, ref={ref.shape[1]}x{ref.shape[0]})"
+            )
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "サイズ不一致",
+                    f"サイズが違います。\n\n"
+                    f"元: {self.current.shape[1]}x{self.current.shape[0]}\n"
+                    f"差分元: {ref.shape[1]}x{ref.shape[0]}"
+                )
+            if self.view_mode in ("ref", "diff"):
+                self.view_mode = "base"
+                self.cmb_view.setCurrentIndex(0)
+            return False
+
+        self.ref = ref
+        self.lbl_diff.setText(f"差分元(自動): {ref.path}")
+        self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
+        return True
+
     def on_select_diff_raw(self):
         if self.current is None:
             QMessageBox.information(self, "Info", "先に元画像（RAW選択）を読み込んでください。")
@@ -662,6 +759,31 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+
+        # 自動選択用フォルダを更新（チェックON/OFFに関係なく「最後に選んだフォルダ」として保持）
+        self.diff_auto_dir = os.path.dirname(path)
+        self.settings.setValue("last_diff_auto_dir", self.diff_auto_dir)
+
+        # 自動ファイル選択ONなら、現在の元画像と同名のファイルをこのフォルダから探して選択する
+        if self.chk_auto_diff.isChecked() and self.current is not None:
+            cand = os.path.join(self.diff_auto_dir, os.path.basename(self.current.path))
+            if os.path.isfile(cand):
+                path = cand
+            else:
+                QMessageBox.information(
+                    self,
+                    "Info",
+                    "自動ファイル選択がONです。\n"
+                    "差分元フォルダ内に、元画像と同名のファイルが見つかりませんでした。\n\n"
+                    f"探したパス: {cand}"
+                )
+                self.ref = None
+                self.diff_i32 = None
+                self.lbl_diff.setText(f"差分元(自動): 見つかりません: {cand}")
+                if self.view_mode in ("ref", "diff"):
+                    self.view_mode = "base"
+                    self.cmb_view.setCurrentIndex(0)
+                return
 
         # 読み込み（u16）
         try:
@@ -685,7 +807,11 @@ class MainWindow(QMainWindow):
             return
 
         self.ref = ref
-        self.lbl_diff.setText(f"差分元: {ref.path}")
+        # 自動ONならラベルに(自動)と出す
+        if self.chk_auto_diff.isChecked():
+            self.lbl_diff.setText(f"差分元(自動): {ref.path}")
+        else:
+            self.lbl_diff.setText(f"差分元: {ref.path}")
 
         # 差分計算（③）
         self.diff_i32 = self.current.img_u16.astype(np.int32) - self.ref.img_u16.astype(np.int32)
@@ -742,6 +868,7 @@ class MainWindow(QMainWindow):
         qimg = qimage_from_gray_u8(gray)
         pix = QPixmap.fromImage(qimg)
         self.view.set_image(pix, img_u16)
+
 
 def main():
     app = QApplication([])
