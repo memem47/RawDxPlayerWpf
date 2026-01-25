@@ -214,6 +214,16 @@ struct IpcContext
     // - lifetime はこの context に完全に従属
     cudaGraphicsResource* cudaIO = nullptr;
 
+    struct CudaTempBuffer
+    {
+        void* devPtr = nullptr;
+        size_t bytes = 0;
+    };
+
+    CudaTempBuffer tmpU16Max{};
+    CudaTempBuffer tmpU16Quarter{};
+    CudaTempBuffer tmpF32Max{};
+    CudaTempBuffer tmpI32Max{};
     // --------------------------
     // Active image size
     // --------------------------
@@ -273,6 +283,11 @@ struct IpcContext
 
         w = h = 0;
         ZeroMemory(&params, sizeof(params));
+
+        if (tmpU16Max.devPtr) { CudaFreeDeviceBuffer(tmpU16Max.devPtr);     tmpU16Max = {}; }
+        if (tmpU16Quarter.devPtr) { CudaFreeDeviceBuffer(tmpU16Quarter.devPtr); tmpU16Quarter = {}; }
+        if (tmpF32Max.devPtr) { CudaFreeDeviceBuffer(tmpF32Max.devPtr);     tmpF32Max = {}; }
+        if (tmpI32Max.devPtr) { CudaFreeDeviceBuffer(tmpI32Max.devPtr);     tmpI32Max = {}; }
     }
 };
 
@@ -512,6 +527,39 @@ static int32_t InitWithIoBuffer_Impl(int32_t gpuId, void* ioBufferPtr)
     
     g_ctx->params = p;
     g_ctx->initialized = true;
+
+    D3D11_BUFFER_DESC ioDesc{};
+    g_ctx->ioBuf->GetDesc(&ioDesc);
+
+    const size_t ioBytes = (size_t)ioDesc.ByteWidth;
+    const size_t maxPixels = ioBytes / sizeof(uint16_t);
+    const size_t quarterPixels = (maxPixels / 4u);
+
+    auto Ensure = [&](IpcContext::CudaTempBuffer& b, size_t bytes) -> int32_t {
+        int ce = CudaEnsureDeviceBuffer(&b.devPtr, &b.bytes, bytes);
+        if (ce != 0) return -1600 - ce;
+        return IPC_OK;
+        };
+
+    // U16 scratch: full capacity + quarter capacity（サイズ違い例）
+    int32_t er = Ensure(g_ctx->tmpU16Max, ioBytes);
+    if (er != IPC_OK) return er;
+
+    if (quarterPixels > 0)
+    {
+        er = Ensure(g_ctx->tmpU16Quarter, quarterPixels * sizeof(uint16_t));
+        if (er != IPC_OK) return er;
+    }
+
+    // 型違い例：float / int
+    er = Ensure(g_ctx->tmpF32Max, maxPixels * sizeof(float));
+    if (er != IPC_OK) return er;
+
+    er = Ensure(g_ctx->tmpI32Max, maxPixels * sizeof(int32_t));
+    if (er != IPC_OK) return er;
+
+
+
     return IPC_OK;
 }
 
@@ -575,7 +623,10 @@ static int32_t Execute_Impl()
             devPtr, g_ctx->w, g_ctx->h,
             p.window, p.level,
             p.enableEdge,
-            enableBlur, enableInvert, enableThreshold, thresholdValue);
+            enableBlur, enableInvert, enableThreshold, thresholdValue,
+            g_ctx->tmpU16Max.devPtr, g_ctx->tmpU16Max.bytes,
+            g_ctx->tmpF32Max.devPtr, g_ctx->tmpF32Max.bytes,
+            g_ctx->tmpI32Max.devPtr, g_ctx->tmpI32Max.bytes);
 
         int cr2 = CudaUnmapResource(g_ctx->cudaIO);
         if (cr != 0)  return -1410 - cr;

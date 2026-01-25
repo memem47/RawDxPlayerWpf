@@ -16,6 +16,7 @@ struct CudaContext
     int h = 0;
 
     bool inited = false;
+
 };
 
 static void CudaContext_Destroy(CudaContext* c)
@@ -650,7 +651,13 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessBuffer_R16_Inplace(
     int enableBlur,
     int enableInvert,
     int enableThreshold,
-    int thresholdValue)
+    int thresholdValue,
+    void* midU16,
+    size_t midU16Bytes,
+    void* midF32,
+    size_t midF32Bytes,
+    void* midI32,
+    size_t midI32Bytes)
 {
     // 入力ポインタと画像サイズの妥当性チェック
     if (!ioDevPtrVoid) return (int)cudaErrorInvalidValue;
@@ -737,4 +744,47 @@ extern "C" __declspec(dllexport) int __cdecl CudaProcessBuffer_R16_Inplace(
     // 全カーネルの完了を同期
     e = cudaDeviceSynchronize();
     return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+
+extern "C" __declspec(dllexport) int __cdecl CudaAllocDeviceBuffer(size_t bytes, void** outDevPtr)
+{
+    if (!outDevPtr || bytes == 0) return (int)cudaErrorInvalidValue;
+    *outDevPtr = nullptr;
+    cudaError_t e = cudaMalloc(outDevPtr, bytes);
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CudaFreeDeviceBuffer(void* devPtr)
+{
+    if (!devPtr) return 0;
+    cudaError_t e = cudaFree(devPtr);
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+extern "C" __declspec(dllexport) int __cdecl CudaEnsureDeviceBuffer(void** ioDevPtr, size_t* ioBytes, size_t requiredBytes)
+{
+    if (!ioDevPtr || !ioBytes || requiredBytes == 0) return (int)cudaErrorInvalidValue;
+
+    if (*ioDevPtr && *ioBytes >= requiredBytes)
+        return 0;
+
+    if (*ioDevPtr)
+    {
+        cudaError_t e0 = cudaFree(*ioDevPtr);
+        *ioDevPtr = nullptr;
+        *ioBytes = 0;
+        if (e0 != cudaSuccess) return (int)e0;
+    }
+
+    cudaError_t e = cudaMalloc(ioDevPtr, requiredBytes);
+    if (e != cudaSuccess)
+    {
+        *ioDevPtr = nullptr;
+        *ioBytes = 0;
+        return (int)e;
+    }
+
+    *ioBytes = requiredBytes;
+    return 0;
 }

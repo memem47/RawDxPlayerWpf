@@ -92,7 +92,13 @@ extern "C" {
         int enableBlur,
         int enableInvert,
         int enableThreshold,
-        int thresholdValue);
+        int thresholdValue,
+        void* midU16,
+        size_t midU16Bytes,
+        void* midF32,
+        size_t midF32Bytes,
+        void* midI32,
+        size_t midI32Bytes);
 
     IPC_API int32_t __cdecl IPC_UploadRaw16(const void* src, int32_t srcBytes);
     IPC_API int32_t __cdecl IPC_UploadRaw16ToBuffer(const void* src, int32_t srcBytes, int32_t width, int32_t height);
@@ -108,3 +114,8 @@ extern "C" {
     IPC_API int32_t __cdecl IPC_GetLastHr();
     IPC_API const char* __cdecl IPC_GetLastErr();
 }
+
+
+extern "C" __declspec(dllexport) int __cdecl CudaAllocDeviceBuffer(size_t bytes, void** outDevPtr);
+extern "C" __declspec(dllexport) int __cdecl CudaFreeDeviceBuffer(void* devPtr);
+extern "C" __declspec(dllexport) int __cdecl CudaEnsureDeviceBuffer(void** ioDevPtr, size_t* ioBytes, size_t requiredBytes);
