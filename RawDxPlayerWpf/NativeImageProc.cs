@@ -7,6 +7,7 @@ namespace RawDxPlayerWpf.Processing
     {
         // DLL名：出力された dll ファイル名に合わせる
         private const string DllName = "ImageProcCudaDll.dll";
+        private const string UtilDllName = "UtilDLL.dll";
 
         [StructLayout(LayoutKind.Sequential, Pack = 1)]
         internal struct IPC_Params
@@ -86,7 +87,7 @@ namespace RawDxPlayerWpf.Processing
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void IPC_DestroyIoSharedHandle(IntPtr sharedHandle);
 
-        [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+        [DllImport(UtilDllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr IPC_CreateIoBuffer(int gpuId, int width, int height);
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
@@ -98,5 +99,15 @@ namespace RawDxPlayerWpf.Processing
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern IntPtr IPC_GetLastErr();
+
+        [DllImport(UtilDllName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int IPC_UploadRaw16ToBufferEx(int gpuId, IntPtr ioBufferPtr,
+                                                             IntPtr src, int srcBytes,
+                                                             int width, int height);
+
+        [DllImport(UtilDllName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int IPC_ReadbackRaw16FromBufferEx(int gpuId, IntPtr ioBufferPtr,
+                                                                 IntPtr dst, int dstBytes,
+                                                                 int width, int height);
     }
 }

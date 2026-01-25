@@ -8,12 +8,16 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RawDxPlayerWpf", "RawDxPlayerWpf\RawDxPlayerWpf.csproj", "{1CDD4082-3568-4174-8386-11F1849FF63D}"
 	ProjectSection(ProjectDependencies) = postProject
 		{271C1826-9072-4059-B327-DEA7FBA80784} = {271C1826-9072-4059-B327-DEA7FBA80784}
+		{67758177-9D17-43BE-A76B-20DD751624E0} = {67758177-9D17-43BE-A76B-20DD751624E0}
 	EndProjectSection
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ImageProcTestRunner", "ImageProcTestRunner\ImageProcTestRunner.vcxproj", "{C38324C0-B9C6-4D70-B390-AAFE977AC6EC}"
 	ProjectSection(ProjectDependencies) = postProject
 		{271C1826-9072-4059-B327-DEA7FBA80784} = {271C1826-9072-4059-B327-DEA7FBA80784}
+		{67758177-9D17-43BE-A76B-20DD751624E0} = {67758177-9D17-43BE-A76B-20DD751624E0}
 	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "UtilDLL", "..\temp\RawDxPlayerWpf\UtilDLL\UtilDLL.vcxproj", "{67758177-9D17-43BE-A76B-20DD751624E0}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -61,6 +65,18 @@ Global
 		{C38324C0-B9C6-4D70-B390-AAFE977AC6EC}.Release|x64.Build.0 = Release|x64
 		{C38324C0-B9C6-4D70-B390-AAFE977AC6EC}.Release|x86.ActiveCfg = Release|Win32
 		{C38324C0-B9C6-4D70-B390-AAFE977AC6EC}.Release|x86.Build.0 = Release|Win32
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Debug|Any CPU.ActiveCfg = Debug|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Debug|Any CPU.Build.0 = Debug|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Debug|x64.ActiveCfg = Debug|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Debug|x64.Build.0 = Debug|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Debug|x86.ActiveCfg = Debug|Win32
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Debug|x86.Build.0 = Debug|Win32
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Release|Any CPU.ActiveCfg = Release|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Release|Any CPU.Build.0 = Release|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Release|x64.ActiveCfg = Release|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Release|x64.Build.0 = Release|x64
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Release|x86.ActiveCfg = Release|Win32
+		{67758177-9D17-43BE-A76B-20DD751624E0}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

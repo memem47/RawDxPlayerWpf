@@ -94,5 +94,49 @@ namespace RawDxPlayerWpf.Processing
                 if (h.IsAllocated) h.Free();
             }
         }
+
+        public void UploadRaw16(int gpuId, IntPtr inoutDxSharedBuffer, byte[] raw16, int w, int h)
+        {
+            if (!_initialized) throw new InvalidOperationException("Not initialized.");
+            if (raw16 == null) throw new ArgumentNullException(nameof(raw16));
+            int bytes = w * h * 2;
+            if (raw16.Length < bytes) throw new ArgumentException("raw16 buffer too small.");
+
+            GCHandle hnd = default;
+            try
+            {
+                hnd = GCHandle.Alloc(raw16, GCHandleType.Pinned);
+                IntPtr p = hnd.AddrOfPinnedObject();
+                int r = NativeImageProc.IPC_UploadRaw16ToBufferEx(gpuId, inoutDxSharedBuffer, p, bytes, w, h);
+                if (r != 0) throw new InvalidOperationException($"IPC_UploadRaw16 failed: {r}");
+            }
+            finally
+            {
+                if (hnd.IsAllocated) hnd.Free();
+            }
+        }
+
+        // NEW: Readback RAW16 in native side (GPU->CPU copy in C Main DLL)
+        public byte[] ReadbackRaw16(int gpuId, IntPtr inoutDxSharedBuffer, int width, int height)
+        {
+            if (!_initialized) return null;
+            int bytes = checked(width * height * 2);
+            var managed = new byte[bytes];
+
+            GCHandle h = default;
+            try
+            {
+                h = GCHandle.Alloc(managed, GCHandleType.Pinned);
+                IntPtr p = h.AddrOfPinnedObject();
+                //int r = NativeImageProc.IPC_ReadbackRaw16(p, bytes);
+                int r = NativeImageProc.IPC_ReadbackRaw16FromBufferEx(gpuId, inoutDxSharedBuffer, p, bytes, width, height);
+                if (r != 0) throw new InvalidOperationException($"IPC_ReadbackRaw16 failed: {r}");
+                return managed;
+            }
+            finally
+            {
+                if (h.IsAllocated) h.Free();
+            }
+        }
     }
 }

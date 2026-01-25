@@ -25,6 +25,7 @@ namespace RawDxPlayerWpf
         private bool _dllInitialized;
 
         // params
+        int _gpuId = 0;
         private int _window = 4000;
         private int _level = 2000;
         private int _enableEdge = 0;        
@@ -102,7 +103,6 @@ namespace RawDxPlayerWpf
 
         private void LoadSequenceFromFile(string filePath)
         {
-            int gpuId = 0;
             StopPlayback();
 
             _seq = RawSequence.FromAnyFileInFolder(filePath);
@@ -116,7 +116,7 @@ namespace RawDxPlayerWpf
 
             // C++側で shared texture + handle を生成
             _ioSharedHandle = NativeImageProc.IPC_CreateIoSharedHandle(
-                gpuId: gpuId,
+                gpuId: _gpuId,
                 width: _seq.Width,
                 height: _seq.Height);
 
@@ -135,7 +135,7 @@ namespace RawDxPlayerWpf
 
             // C++側で IO buffer（ID3D11Buffer*）を生成
             _ioBuffer = NativeImageProc.IPC_CreateIoBuffer(
-                gpuId: gpuId,
+                gpuId: _gpuId,
                 width: _seq.Width,
                 height: _seq.Height);
 
@@ -163,8 +163,8 @@ namespace RawDxPlayerWpf
             // init dll (single IO handle)
             try
             {
-                //_processor.Initialize(gpuId, _ioSharedHandle);
-                _processor.InitializeWithIoBuffer(gpuId, _ioBuffer);
+                //_processor.Initialize(_gpuId, _ioSharedHandle);
+                _processor.InitializeWithIoBuffer(_gpuId, _ioBuffer);
                 _dllInitialized = true;
                 ApplyParamsToDll();
             }
@@ -273,7 +273,7 @@ namespace RawDxPlayerWpf
             byte[] raw16In = RawFrameReader.Load16RawBytes(
                 path, _seq.Width, _seq.Height);
 
-            (_processor as NativeImageProcessor)?.UploadRaw16(
+            (_processor as NativeImageProcessor)?.UploadRaw16(_gpuId, _ioBuffer,
                 raw16In, _seq.Width, _seq.Height);
 
             sw.Stop();
@@ -309,7 +309,7 @@ namespace RawDxPlayerWpf
             sw.Restart();
 
             byte[] raw16Out = (_processor as NativeImageProcessor)
-                ?.ReadbackRaw16(_seq.Width, _seq.Height);
+                ?.ReadbackRaw16(_gpuId, _ioBuffer, _seq.Width, _seq.Height);
 
             sw.Stop();
             tRead = sw.ElapsedMilliseconds;
