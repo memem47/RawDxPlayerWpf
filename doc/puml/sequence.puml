@@ -1,0 +1,33 @@
+@startuml rawdx_execute
+
+actor User
+participant "RawDxPlayerWpf (WPF)" as WPF
+participant "DxRenderer (C#)" as DX
+participant "ImageProcApi (C++/CLI)" as CLI
+participant "NativeImageProcessor (C++)" as CPP
+participant "CudaInterop / Kernels (CUDA)" as CUDA
+participant "GPU" as GPU
+
+User -> WPF : Click "Execute" / Play tick
+WPF -> DX : ExecuteFrame()
+
+DX -> CLI : Initialize(if needed)
+CLI -> CPP : Initialize(deviceId, d3dBufferPtr,...)
+CPP -> CUDA : SetupInterop(d3dBufferPtr)
+CUDA -> GPU : Register/Map resources
+
+DX -> CLI : SetParameters(params)
+CLI -> CPP : SetParameters(params)
+
+DX -> CLI : Execute()
+CLI -> CPP : Execute()
+CPP -> CUDA : LaunchKernels()
+CUDA -> GPU : kernel<<<grid,block>>>()
+
+CUDA --> CPP : Done
+CPP --> CLI : status
+CLI --> DX : status
+
+DX -> WPF : Present / Update UI
+
+@enduml

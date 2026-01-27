@@ -1,0 +1,26 @@
+@startuml
+title RawDxPlayerWpf - Component Diagram (Overview)
+
+package "UI Layer" {
+  [RawDxPlayerWpf\n(WPF App)]
+}
+
+package "Interop Layer" {
+  [ImageProcApi\n(C++/CLI DLL)]
+}
+
+package "Native Processing" {
+  [NativeImageProcessor\n(C++ DLL)]
+  [CudaKernels\n(CUDA)]
+}
+
+package "Hardware" {
+  [GPU]
+}
+
+[RawDxPlayerWpf\n(WPF App)] --> [ImageProcApi\n(C++/CLI DLL)]
+[ImageProcApi\n(C++/CLI DLL)] --> [NativeImageProcessor\n(C++ DLL)]
+[NativeImageProcessor\n(C++ DLL)] --> [CudaKernels\n(CUDA)]
+[CudaKernels\n(CUDA)] --> [GPU]
+
+@enduml

@@ -1,0 +1,36 @@
+@startuml
+title RawDxPlayerWpf - Component Diagram (Detailed)
+
+package "UI Layer" {
+  component "RawDxPlayerWpf\n(WPF)" as WPF
+}
+
+package "Rendering" {
+  component "DxRenderer\n(C#)" as DX
+}
+
+package "Interop" {
+  component "ImageProcApi\n(C++/CLI)" as CLI
+}
+
+package "Native Processing" {
+  component "NativeImageProcessor\n(C++)" as CPP
+  component "CudaInterop\n(CUDA)" as CUDA
+}
+
+package "Graphics / Compute" {
+  component "D3D11 Shared Buffer" as D3D
+  component "GPU"
+}
+
+WPF --> DX : UI操作 / 再生制御
+DX --> CLI : Initialize / Execute
+CLI --> CPP : API Call
+CPP --> CUDA : Kernel Launch
+CUDA --> GPU
+
+DX --> D3D : Create / Share
+CPP --> D3D : Read / Write
+CUDA --> D3D : CUDA Graphics Interop
+
+@enduml

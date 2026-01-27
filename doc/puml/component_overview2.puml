@@ -1,0 +1,24 @@
+@startuml
+title RawDxPlayerWpf - Component Diagram (With Tools)
+
+package "Applications" {
+  [RawDxPlayerWpf\n(WPF)]
+  [ImageProcCli\n(Test Tool)]
+}
+
+package "Interop" {
+  [ImageProcApi\n(C++/CLI)]
+}
+
+package "Native Core" {
+  [NativeImageProcessor]
+  [CudaKernels]
+}
+
+[RawDxPlayerWpf\n(WPF)] --> [ImageProcApi\n(C++/CLI)]
+[ImageProcCli\n(Test Tool)] --> [ImageProcApi\n(C++/CLI)]
+
+[ImageProcApi\n(C++/CLI)] --> [NativeImageProcessor]
+[NativeImageProcessor] --> [CudaKernels]
+
+@enduml
