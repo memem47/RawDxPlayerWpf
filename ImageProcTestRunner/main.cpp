@@ -1,204 +1,274 @@
 #include <iostream>
-#include <fstream>
 #include <string>
 #include <vector>
 #include <filesystem>
-#include <stdexcept>
+#include <algorithm>
+
+#include <gtest/gtest.h>
 
 #include "csv.h"
-#include "raw16.h"
-#include "metrics.h"
-
-// ★あなたの DLL ヘッダ
-#include "ImageProcApi.h"
+#include "runner_core.h"
 
 namespace fs = std::filesystem;
 
-static bool metric_pass(const std::string& metric, double value, double pass_value) {
-    if (metric == "exact")     return value == 0.0;
-    if (metric == "max_abs")   return value <= pass_value;
-    if (metric == "mae")       return value <= pass_value;
-    if (metric == "psnr")      return value >= pass_value;
-    return false;
-}
+// ------------------------------------------------------------
+// globals (shared between main() and TEST body)
+// ------------------------------------------------------------
+static RunnerOptions g_opt;
+static ResultsCollector g_results;
+static std::vector<CsvRow> g_rows;
 
-static MetricResult compute_metric(const std::string& metric,
-    const std::vector<uint16_t>& out,
-    const std::vector<uint16_t>& gold)
+// gtest_filter を gtestのAPIに頼らず argv から取得して保持
+static std::string g_gtestFilter = "*";
+
+// ------------------------------------------------------------
+// results.csv output on teardown
+// ------------------------------------------------------------
+class ResultsEnv : public ::testing::Environment
 {
-    if (metric == "exact")   return metric_exact(out, gold);
-    if (metric == "max_abs") return metric_max_abs(out, gold);
-    if (metric == "mae")     return metric_mae(out, gold);
-    if (metric == "psnr")    return metric_psnr(out, gold);
-    throw std::runtime_error("Unknown metric: " + metric);
-}
+public:
+    explicit ResultsEnv(fs::path outdir) : outdir_(std::move(outdir)) {}
 
-static IPC_Params make_params_from_csv(const CsvRow& r, int w, int h)
-{
-    IPC_Params p{};
-    p.width = w;
-    p.height = h;
-    p.sizeBytes = (uint32_t)sizeof(IPC_Params);
-    p.version = 1;
-
-    p.window = r.i("window");
-    p.level = r.i("level");
-    p.enableEdge = r.i("enable_edge");
-
-    // reserved[0] = enablePostFilter (とコメントにあるが、あなたの実装では
-    // reserved[0..3] を blur/invert/threshold に使っている前提で合わせる
-    p.reserved[0] = r.i("enable_blur");
-    p.reserved[1] = r.i("enable_invert");
-    p.reserved[2] = r.i("enable_threshold");
-    p.reserved[3] = r.i("threshold_value");
-    return p;
-}
-
-static void safe_shutdown_and_release(void*& ioBuf)
-{
-    // DLL内部がioBufを参照している可能性があるので、先にShutdown
-    IPC_Shutdown();
-
-    if (ioBuf) {
-        IPC_ReleaseD3D11Resource(ioBuf); // COM Release
-        ioBuf = nullptr;
+    void TearDown() override
+    {
+        g_results.WriteCsv(outdir_);
+        std::cout << "Results: " << (outdir_ / "results.csv").string() << "\n";
     }
+
+private:
+    fs::path outdir_;
+};
+
+// ------------------------------------------------------------
+// wildcard match (* and ?)
+// ------------------------------------------------------------
+static bool WildcardMatch(const char* pat, const char* str)
+{
+    if (!pat || !str) return false;
+
+    while (*pat) {
+        if (*pat == '*') {
+            ++pat;
+            if (!*pat) return true;
+            while (*str) {
+                if (WildcardMatch(pat, str)) return true;
+                ++str;
+            }
+            return false;
+        }
+        if (*pat == '?') {
+            if (!*str) return false;
+            ++pat; ++str;
+            continue;
+        }
+        if (*pat != *str) return false;
+        ++pat; ++str;
+    }
+    return *str == '\0';
 }
 
+static bool MatchesFilterExpr(const std::string& filter,
+    const std::string& suite,
+    const std::string& test)
+{
+    // gtest filter 互換（最低限）
+    // pos1:pos2-neg1:neg2
+    const std::string full = suite + "." + test;
+
+    if (filter.empty()) return true;
+
+    std::string pos = filter;
+    std::string neg;
+
+    const auto dash = filter.find('-');
+    if (dash != std::string::npos) {
+        pos = filter.substr(0, dash);
+        neg = filter.substr(dash + 1);
+    }
+
+    auto anyMatchOr = [&](const std::string& part) -> bool {
+        if (part.empty()) return true;
+        size_t start = 0;
+        while (start <= part.size()) {
+            size_t end = part.find(':', start);
+            if (end == std::string::npos) end = part.size();
+            std::string token = part.substr(start, end - start);
+            if (!token.empty()) {
+                if (WildcardMatch(token.c_str(), full.c_str())) return true;
+            }
+            start = end + 1;
+        }
+        return false;
+        };
+
+    const bool posOk = anyMatchOr(pos);
+    const bool negHit = !neg.empty() && anyMatchOr(neg);
+    return posOk && !negHit;
+}
+
+// ------------------------------------------------------------
+// argv helpers
+// ------------------------------------------------------------
+static bool StartsWith(const std::string& s, const std::string& pfx)
+{
+    return s.rfind(pfx, 0) == 0;
+}
+
+static void PrintUsage()
+{
+    std::cout
+        << "Usage:\n"
+        << "  ImageProcTestRunner <tests/test_cases.csv>\n"
+        << "      [--gpu 0]\n"
+        << "      [--outdir tests/out]\n"
+        << "      [--no-save-out]\n"
+        << "      [--generate-golden]\n"
+        << "      [--help]\n"
+        << "      (and any GoogleTest flags, e.g. --gtest_filter=..., --gtest_output=xml:...)\n"
+        << "\n"
+        << "Examples:\n"
+        << "  ImageProcTestRunner tests/test_cases.csv --gpu 0 --outdir tests/out\n"
+        << "  ImageProcTestRunner tests/test_cases.csv --generate-golden --outdir tests/out --gtest_filter=CsvCases.*Sobel*\n"
+        << "\n"
+        << "Notes:\n"
+        << "  - results.csv is written to <outdir>/results.csv\n"
+        << "  - gtest XML is written to <outdir>/gtest.xml by default unless you pass --gtest_output\n";
+}
+
+// ------------------------------------------------------------
+// Single TEST runs selected CSV rows.
+// Filter comes from argv-parsed g_gtestFilter (no gtest API dependence).
+// ------------------------------------------------------------
+TEST(CsvCases, RunSelected)
+{
+    ASSERT_FALSE(g_rows.empty()) << "CSV rows are empty. Check csv path.";
+
+    const std::string suite = "CsvCases";
+    const std::string filter = g_gtestFilter; // from argv
+
+    int selected = 0;
+
+    for (const auto& r : g_rows) {
+        const std::string rawName = r.at("name");
+        const std::string testName = SanitizeGTestName(rawName);
+
+        if (!MatchesFilterExpr(filter, suite, testName)) {
+            continue;
+        }
+
+        selected++;
+
+        auto cr = RunOneCase(r, g_opt);
+        g_results.Add(cr);
+
+        if (g_opt.generateGolden) {
+            if (cr.status == CaseStatus::ERROR) {
+                ADD_FAILURE() << "[ERROR] " << cr.name << " : " << cr.detail;
+            }
+            continue;
+        }
+
+        if (cr.status == CaseStatus::ERROR) {
+            ADD_FAILURE() << "[ERROR] " << cr.name << " : " << cr.detail;
+            continue;
+        }
+
+        EXPECT_EQ(cr.status, CaseStatus::PASS)
+            << "case=" << cr.name
+            << " metric=" << cr.metric
+            << " value=" << cr.value
+            << " pass_value=" << cr.pass_value;
+    }
+
+    EXPECT_GT(selected, 0) << "No CSV cases matched filter: " << filter;
+}
+
+// ------------------------------------------------------------
+// main
+// ------------------------------------------------------------
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::cout << "Usage: ImageProcTestRunner <tests/test_cases.csv> [--gpu 0] [--outdir tests/out] [--no-save-out]\n";
+        PrintUsage();
         return 2;
     }
 
-    std::string csvPath = argv[1];
-    int gpuId = 0;
-    fs::path outdir = "tests/out";
-    bool saveOut = true;
-    bool generateGolden = false;
+    // runner args defaults
+    g_opt.csvPath = argv[1];
+    g_opt.gpuId = 0;
+    g_opt.outdir = fs::path("tests/out");
+    g_opt.saveOut = true;
+    g_opt.generateGolden = false;
 
+    // rebuild argv for gtest
+    std::vector<std::string> kept;
+    kept.reserve((size_t)argc);
+    kept.push_back(argv[0]);
+
+    // parse our args + capture --gtest_filter if present
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--gpu" && i + 1 < argc) gpuId = std::stoi(argv[++i]);
-        else if (a == "--outdir" && i + 1 < argc) outdir = argv[++i];
-        else if (a == "--no-save-out") saveOut = false;
-        else if (a == "--generate-golden") generateGolden = true;
+
+        if (a == "--help" || a == "-h") {
+            PrintUsage();
+            return 0;
+        }
+
+        if (a == "--gpu" && i + 1 < argc) { g_opt.gpuId = std::stoi(argv[++i]); continue; }
+        if (a == "--outdir" && i + 1 < argc) { g_opt.outdir = argv[++i]; continue; }
+        if (a == "--no-save-out") { g_opt.saveOut = false; continue; }
+        if (a == "--generate-golden") { g_opt.generateGolden = true; continue; }
+
+        // Capture filter without relying on gtest macros
+        if (StartsWith(a, "--gtest_filter=")) {
+            // ユーザーの gtest_filter は「CSVケース選択」に使う。gtest本体には渡さない。
+            g_gtestFilter = a.substr(std::string("--gtest_filter=").size());
+            continue;
+        }
+
+        kept.push_back(a);
     }
 
-    fs::create_directories(outdir);
+    // default filter if not provided
+    if (g_gtestFilter.empty()) g_gtestFilter = "*";
 
-    auto rows = read_csv(csvPath);
+    // default XML output to <outdir>/gtest.xml unless user specified --gtest_output
+    const bool hasGTestOutput = std::any_of(kept.begin(), kept.end(),
+        [](const std::string& s) { return StartsWith(s, "--gtest_output="); });
 
-    fs::path resultCsv = outdir / "results.csv";
-    std::ofstream ofs(resultCsv.string());
-    ofs << "name,metric,value,pass_value,status,input,golden,out,detail\n";
-
-    int nPass = 0, nFail = 0;
-
-    for (const auto& r : rows)
-    {
-        const std::string name = r.at("name");
-        const std::string inPath = r.at("input");
-        const std::string goldPath = r.at("golden");
-        const int w = r.i("width");
-        const int h = r.i("height");
-        const std::string metric = r.at("metric");
-        const double pass_value = std::stod(r.at("pass_value"));
-
-        fs::path outPath = outdir / (name + ".raw");
-
-        void* ioBuf = nullptr;
-
-        try {
-            auto in = load_raw16(inPath, w, h);
-            std::vector<uint16_t> gold;
-            if (!generateGolden) {
-                gold = load_raw16(goldPath, w, h);
-            }
-            // 1) IO buffer作成（ID3D11Buffer* を void* として受け取る）
-            ioBuf = IPC_CreateIoBuffer(gpuId, w, h);
-            if (!ioBuf) {
-                int32_t hr = IPC_GetLastHr();
-                const char* msg = IPC_GetLastErr();
-                throw std::runtime_error(std::string("IPC_CreateIoBuffer failed. hr=0x")
-                    + [](int32_t v) { char b[16]; sprintf_s(b, "%08X", (unsigned)v); return std::string(b); } (hr)
-                    +" " + (msg ? msg : ""));
-            }
-
-            // 2) Init（buffer版）
-            int32_t rc = IPC_InitWithIoBuffer(gpuId, ioBuf);
-            if (rc != IPC_OK) throw std::runtime_error("IPC_InitWithIoBuffer failed: " + std::to_string(rc));
-
-            // 3) Params
-            IPC_Params p = make_params_from_csv(r, w, h);
-            rc = IPC_SetParams(&p);
-            if (rc != IPC_OK) throw std::runtime_error("IPC_SetParams failed: " + std::to_string(rc));
-
-            // 4) Upload（buffer版）
-            rc = IPC_UploadRaw16ToBuffer(in.data(), (int32_t)(in.size() * sizeof(uint16_t)), w, h);
-            if (rc != IPC_OK) throw std::runtime_error("IPC_UploadRaw16ToBuffer failed: " + std::to_string(rc));
-
-            // 5) Execute
-            rc = IPC_Execute();
-            if (rc != IPC_OK) throw std::runtime_error("IPC_Execute failed: " + std::to_string(rc));
-
-            // 6) Readback（buffer版）
-            std::vector<uint16_t> out((size_t)w * (size_t)h);
-            rc = IPC_ReadbackRaw16FromBuffer(out.data(), (int32_t)(out.size() * sizeof(uint16_t)));
-            if (rc != IPC_OK) throw std::runtime_error("IPC_ReadbackRaw16FromBuffer failed: " + std::to_string(rc));
-
-            // 7) shutdown & release
-            safe_shutdown_and_release(ioBuf);
-
-            if (!generateGolden) {
-                // 保存
-                if (saveOut) save_raw16(outPath.string(), out);
-
-                // 評価
-                auto mr = compute_metric(metric, out, gold);
-                bool ok = metric_pass(metric, mr.value, pass_value);
-
-
-                //ofs << "name,metric,value,pass_value,status,input,golden,out,detail\n";
-                ofs << name << "," << metric << "," << mr.value << "," << pass_value << ","
-                    << (ok ? "PASS" : "FAIL") << ","
-                    << inPath << "," << goldPath << "," << (saveOut ? outPath.string() : "") << ",OK\n";
-
-                if (ok) nPass++; else nFail++;
-
-                std::cout << "[" << (ok ? "PASS" : "FAIL") << "] " << name
-                    << " metric=" << metric << " value=" << mr.value << "\n";
-            }
-            else
-            {
-                fs::path gpath(goldPath);
-                if (!gpath.parent_path().empty()) {
-                    fs::create_directories(gpath.parent_path());
-                }
-                save_raw16(gpath.string(), out);
-
-                //ofs << "name,metric,value,pass_value,status,input,golden,out,detail\n";
-                ofs << name << "," << metric << "," << "" << "," << pass_value << ","
-                    << "GENERATED" << ","
-                    << inPath << "," << goldPath << "," << (saveOut ? outPath.string() : "") << ",Wrote golden\n";
-            }
-
-        }
-        catch (const std::exception& e)
-        {
-            safe_shutdown_and_release(ioBuf);
-
-            ofs << name << "," << metric << ",nan," << pass_value << ",ERROR,"
-                << inPath << "," << goldPath << "," << (saveOut ? outPath.string() : "") << ","
-                << "\"" << e.what() << "\"\n";
-
-            nFail++;
-            std::cout << "[ERROR] " << name << " : " << e.what() << "\n";
-        }
+    if (!hasGTestOutput) {
+        fs::create_directories(g_opt.outdir);
+        kept.push_back(std::string("--gtest_output=xml:") + (g_opt.outdir / "gtest.xml").string());
     }
 
-    std::cout << "Done. PASS=" << nPass << " FAIL=" << nFail << "\n";
-    std::cout << "Results: " << resultCsv.string() << "\n";
-    return (nFail == 0) ? 0 : 1;
+    kept.push_back("--gtest_filter=CsvCases.RunSelected");
+
+    // InitGoogleTest with rebuilt argv
+    std::vector<std::string> keptStorage = kept;
+    std::vector<char*> newArgv;
+    newArgv.reserve(keptStorage.size());
+    for (auto& s : keptStorage) newArgv.push_back(s.data());
+    int newArgc = (int)newArgv.size();
+
+    ::testing::InitGoogleTest(&newArgc, newArgv.data());
+
+    // load CSV
+    g_rows = read_csv(g_opt.csvPath);
+    if (g_rows.empty()) {
+        std::cerr << "No rows loaded from csv: " << g_opt.csvPath << "\n";
+        return 2;
+    }
+
+    ::testing::AddGlobalTestEnvironment(new ResultsEnv(g_opt.outdir));
+
+    const int rc = RUN_ALL_TESTS();
+
+    std::cout << "Done. PASS=" << g_results.PassCount()
+        << " FAIL=" << g_results.FailCount()
+        << " ERROR=" << g_results.ErrorCount()
+        << " GENERATED=" << g_results.GeneratedCount()
+        << "\n";
+    std::cout << "OutDir: " << g_opt.outdir.string() << "\n";
+
+    return rc;
 }
